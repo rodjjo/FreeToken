@@ -198,7 +198,7 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_content_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -228,6 +228,26 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+def _render_content_parts(parts: list[Any]) -> str | list[Any]:
+    """Collapse a content list for the chat template, keeping images intact.
+
+    Text-only content becomes a plain string, which is what every template expects and
+    what this server has always produced. Content that carries an image stays a list so
+    the tokenizer worker can split the pictures out (``split_image_parts``) and run the
+    HF processor; flattening it here is what used to make images vanish silently.
+    """
+    if not any(isinstance(p, dict) and p.get("type") == "image_url" for p in parts):
+        return _flatten_text_parts(parts)
+    kept: list[Any] = []
+    for part in parts:
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype in ("text", "image_url"):
+            kept.append(part)
+        else:
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    return kept
 
 
 def _flatten_text_parts(parts: list[Any]) -> str:

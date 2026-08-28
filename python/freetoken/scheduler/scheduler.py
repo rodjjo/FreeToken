@@ -520,6 +520,19 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.pixel_values is not None and msg.mm_embeds is None:
+                # Online image path: the tokenizer worker produced the processor tensors;
+                # the vision tower lives here, so run it once at admission and hand the
+                # request its soft tokens. Failing here (vision off, OOM, shape mismatch)
+                # is terminal for THIS request only -- never a worker crash.
+                try:
+                    msg.mm_embeds = self._encode_request_images(msg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_rank0("image encode failed for request %d: %r", msg.uid, exc)
+                    self.send_result(
+                        [ErrorReplyMsg(uid=msg.uid, error=f"could not process image input: {exc}")]
+                    )
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -816,6 +829,24 @@ class Scheduler(SchedulerIOMixin):
             sample_args=self.engine.sampler.prepare(batch),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
+        )
+
+    def _encode_request_images(self, msg: UserMsg) -> torch.Tensor:
+        """Run the vision tower on one request's processor tensors -> soft-token embeds.
+
+        The scheduler process owns the model, so this is the only place the online path can
+        do it (the tokenizer worker has no GPU model, and the serialized queue cannot carry
+        the resulting device tensor from anywhere else)."""
+        model = self.engine.model
+        encode = getattr(model, "encode_images", None)
+        if encode is None:
+            raise RuntimeError(
+                f"{type(model).__name__} does not accept image input "
+                "(vision is off unless FREETOKEN_LOAD_VISION=1)"
+            )
+        device = self.engine.device
+        return encode(
+            msg.pixel_values.to(device), msg.image_position_ids.to(device)
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:

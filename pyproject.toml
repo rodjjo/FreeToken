@@ -71,6 +71,11 @@ ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
+# Image input (server /v1/messages + /v1/chat/completions). The HF image processors these
+# checkpoints ship are torchvision-based, and torchvision hard-pins its torch: 0.26 is the
+# build for the torch 2.11 this project requires, so it installs alongside rather than
+# dragging in a second torch.
+vision = ["pillow>=10", "torchvision>=0.26,<0.27"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.

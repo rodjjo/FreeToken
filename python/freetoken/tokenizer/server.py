@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from typing import Any, List
 
 import torch
@@ -95,7 +96,7 @@ def _tokenize_requests(
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokens, mm = tokenize_manager.encode([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -120,11 +121,33 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
+        ok_tensors.append((tokens, mm))
     return ok_msgs, ok_tensors, errors
 
 
 @torch.inference_mode()
+def _image_processor_path(tokenizer_path: str) -> str | None:
+    """The local checkpoint dir to load an image processor from, or None.
+
+    Requires BOTH that vision is switched on and that the checkpoint actually ships a
+    processor config -- a text-only checkpoint under FREETOKEN_LOAD_VISION=1 still has no
+    images to process."""
+    from freetoken.models.config import vision_load_enabled
+
+    if not vision_load_enabled():
+        return None
+    try:
+        from freetoken.utils import download_hf_weight
+
+        folder = download_hf_weight(tokenizer_path)
+    except Exception:  # noqa: BLE001 - never block startup on this probe
+        return None
+    for name in ("processor_config.json", "preprocessor_config.json"):
+        if os.path.isfile(os.path.join(folder, name)):
+            return folder
+    return None
+
+
 def tokenize_worker(
     *,
     tokenizer_path: str,
@@ -147,7 +170,14 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    # Image input needs the checkpoint's HF processor. Gate it on the same switch the
+    # model build uses (FREETOKEN_LOAD_VISION): with vision off the scheduler has no
+    # vision tower to run, so accepting images here would only fail later and further from
+    # the cause. None => image blocks are rejected with a clear message.
+    processor_path = _image_processor_path(tokenizer_path)
+    tokenize_manager = TokenizeManager(tokenizer, processor_path=processor_path)
+    if processor_path is not None:
+        logger.info("image input enabled (processor: %s)", processor_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -254,8 +284,16 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=t,
+                            sampling_params=msg.sampling_params,
+                            pixel_values=mm.pixel_values if mm is not None else None,
+                            image_position_ids=(
+                                mm.image_position_ids if mm is not None else None
+                            ),
+                        )
+                        for msg, (t, mm) in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
