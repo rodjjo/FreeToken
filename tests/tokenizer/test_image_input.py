@@ -161,3 +161,33 @@ def test_unchunkable_multimodal_request_is_rejected_not_fatal():
     mgr.rejections.extend(adder.rejected)
     assert mgr.drain_rejections() == [(9, reason)]
     assert mgr.drain_rejections() == [], "draining is one-shot"
+
+
+# ------------------------------------------------------------------ vision-capable gate
+def test_text_only_family_never_gets_an_image_processor(monkeypatch):
+    """A multimodal CHECKPOINT served by a text-only family (Ornith / qwen3_5_moe, whose
+    parse_config pins vision_config=None) ships processor files but has no encode_images.
+    Accepting the image at the tokenizer would only fail later, further from the cause."""
+    from types import SimpleNamespace
+
+    import freetoken.models.weight as weight_mod
+    from freetoken.tokenizer.server import _image_processor_path
+
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setattr(
+        weight_mod, "_spec_for_model_path",
+        lambda path: (SimpleNamespace(is_multimodal=False), None),
+    )
+    assert _image_processor_path("some/text-only-model") is None
+
+
+def test_probe_failure_disables_images_rather_than_blocking_startup(monkeypatch):
+    import freetoken.models.weight as weight_mod
+    from freetoken.tokenizer.server import _image_processor_path
+
+    def _boom(path):
+        raise RuntimeError("unresolvable path")
+
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setattr(weight_mod, "_spec_for_model_path", _boom)
+    assert _image_processor_path("nonexistent/model") is None

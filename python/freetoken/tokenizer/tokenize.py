@@ -133,8 +133,11 @@ class TokenizeManager:
             if self._processor_obj is None:
                 if self._processor_path is None:
                     raise ValueError(
-                        "this model does not accept image input (no image processor in the "
-                        "checkpoint, or vision is off -- set FREETOKEN_LOAD_VISION=1)"
+                        "this model does not accept image input: either its family is "
+                        "served text-only here (only gemma-4 has a vision tower today -- "
+                        "qwen3_5_moe/Ornith ships processor files but is text-only), or "
+                        "vision is off (set FREETOKEN_LOAD_VISION=1), or the checkpoint "
+                        "has no processor config"
                     )
                 try:
                     from transformers import AutoProcessor

@@ -841,8 +841,9 @@ class Scheduler(SchedulerIOMixin):
         encode = getattr(model, "encode_images", None)
         if encode is None:
             raise RuntimeError(
-                f"{type(model).__name__} does not accept image input "
-                "(vision is off unless FREETOKEN_LOAD_VISION=1)"
+                f"{type(model).__name__} was built without a vision tower -- this model "
+                "family is served text-only, or FREETOKEN_LOAD_VISION was not set when it "
+                "was loaded"
             )
         device = self.engine.device
         return encode(

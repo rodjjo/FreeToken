@@ -129,16 +129,19 @@ def _tokenize_requests(
 def _image_processor_path(tokenizer_path: str) -> str | None:
     """The local checkpoint dir to load an image processor from, or None.
 
-    Requires BOTH that vision is switched on and that the checkpoint actually ships a
-    processor config -- a text-only checkpoint under FREETOKEN_LOAD_VISION=1 still has no
-    images to process."""
-    from freetoken.models.config import vision_load_enabled
-
-    if not vision_load_enabled():
-        return None
+    The gate is the model FreeToken will actually build: ``is_multimodal`` is true only
+    when the model family has a vision tower here AND vision is switched on
+    (FREETOKEN_LOAD_VISION). Checking the checkpoint's processor files alone is not
+    enough -- a multimodal checkpoint whose family is served text-only (Ornith /
+    qwen3_5_moe, ``vision_config=None``) ships processor configs but has no encode_images,
+    so accepting the image here would only fail later, further from the cause."""
     try:
+        from freetoken.models.weight import _spec_for_model_path
         from freetoken.utils import download_hf_weight
 
+        model_config, _ = _spec_for_model_path(tokenizer_path)
+        if not model_config.is_multimodal:
+            return None
         folder = download_hf_weight(tokenizer_path)
     except Exception:  # noqa: BLE001 - never block startup on this probe
         return None
