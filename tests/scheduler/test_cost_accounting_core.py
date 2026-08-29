@@ -93,7 +93,7 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 4), (2, 34, 0)])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
-    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
+    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch, drain_rejections=lambda: [])
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
     events = []
 
@@ -117,7 +117,7 @@ def test_prepare_failure_emits_no_prompt_admission():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 0)])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
-    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
+    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch, drain_rejections=lambda: [])
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
     sent = []
 

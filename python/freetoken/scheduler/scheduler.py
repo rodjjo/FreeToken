@@ -865,6 +865,12 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        for uid, reason in self.prefill_manager.drain_rejections():
+            # Requests the prefill manager found unschedulable no matter how long they wait
+            # (today: a multimodal prompt that cannot fit one chunk). Terminal for that
+            # request only -- the loop keeps running.
+            logger.warning_rank0("Dropping request %d: %s", uid, reason)
+            self.send_result([ErrorReplyMsg(uid=uid, error=reason, code="context_length_exceeded")])
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

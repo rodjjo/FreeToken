@@ -47,6 +47,9 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # (uid, reason) for requests this pass found unschedulable no matter how long they
+    # wait. The manager drains these into terminal replies and drops them from the queue.
+    rejected: List[Tuple[int, str]] = field(default_factory=list)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -164,6 +167,22 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
+        if is_chunked and pending_req.mm_embeds is not None:
+            # A multimodal prompt cannot be split: the model asserts that every image
+            # token's soft embedding is in the same forward. Retrying cannot make the chunk
+            # bigger, so this is terminal for the request -- record it and return None so
+            # the caller's normal release path frees what this pass allocated. Raising here
+            # instead would take the scheduler worker (and the server) down.
+            self.rejected.append(
+                (
+                    pending_req.uid,
+                    f"prompt with images needs {remain_len} tokens in one prefill chunk but "
+                    f"only {chunk_size} fit; raise --max-prefill-length, and for a "
+                    f"sliding-window model the window pool caps it further "
+                    f"(--swa-num-pages-override / --kv-reserve-tokens)",
+                )
+            )
+            return None
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -171,11 +190,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -242,6 +256,13 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    # Terminal (uid, reason) pairs produced by the last scheduling pass; the scheduler
+    # drains them into error replies.
+    rejections: List[Tuple[int, str]] = field(default_factory=list)
+
+    def drain_rejections(self) -> List[Tuple[int, str]]:
+        out, self.rejections = self.rejections, []
+        return out
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -287,6 +308,12 @@ class PrefillManager:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
                 break  # We cannot add more requests
+        if adder.rejected:
+            # Drop them before the prefix arithmetic below: a rejected request must not be
+            # retried (nothing about the next pass would make its chunk any bigger).
+            rejected_uids = {uid for uid, _ in adder.rejected}
+            self.rejections.extend(adder.rejected)
+            self.pending_list = [p for p in self.pending_list if p.uid not in rejected_uids]
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]

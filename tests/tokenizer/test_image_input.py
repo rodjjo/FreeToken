@@ -114,3 +114,50 @@ def test_user_msg_carries_image_tensors():
     assert got.pixel_values.shape == (1, 8, 12)
     assert got.image_position_ids.shape == (1, 8, 2)
     assert torch.equal(got.input_ids, msg.input_ids)
+
+
+# ------------------------------------------------------- unchunkable multimodal prompts
+def test_unchunkable_multimodal_request_is_rejected_not_fatal():
+    """A multimodal prompt that cannot fit one prefill chunk must fail the REQUEST.
+
+    The bound is not just --max-prefill-length: on a sliding-window model the swa pool
+    caps the chunk too, which is how a 33k-token agent prompt still chunked at
+    --max-prefill-length 40960. Raising from the chunker took the scheduler worker down.
+    """
+    import torch
+
+    from freetoken.core import SamplingParams
+    from freetoken.message import UserMsg
+    from freetoken.scheduler.prefill import PrefillAdder, PrefillManager
+
+    class _NoSwa:  # non-sliding-window cache: chunking is capped by token_budget alone
+        swa_paged = False
+
+    adder = PrefillAdder(
+        token_budget=8192, reserved_size=0, cache_manager=_NoSwa(), table_manager=None
+    )
+    pending = UserMsg(
+        uid=9,
+        input_ids=torch.zeros(9383, dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        mm_embeds=torch.randn(266, 16),
+    )
+
+    class _Pending:  # the fields _add_one_req reads before the mm check
+        uid = 9
+        input_len = 9383
+        mm_embeds = pending.mm_embeds
+
+    # chunk_size is capped by token_budget -> is_chunked -> rejection, no exception.
+    got = PrefillAdder._add_one_req(
+        adder, pending_req=_Pending(), cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is None, "must return None so the caller releases the pass's resources"
+    assert [uid for uid, _ in adder.rejected] == [9]
+    reason = adder.rejected[0][1]
+    assert "9383" in reason and "8192" in reason and "one prefill chunk" in reason
+
+    mgr = PrefillManager(cache_manager=None, table_manager=None, decode_manager=None)
+    mgr.rejections.extend(adder.rejected)
+    assert mgr.drain_rejections() == [(9, reason)]
+    assert mgr.drain_rejections() == [], "draining is one-shot"
