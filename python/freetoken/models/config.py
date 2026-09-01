@@ -11,10 +11,26 @@ VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 
 
+#: Set once at startup from ``--vision`` (server) so the weight loader and every model's
+#: parse_config see the same answer without threading ServerArgs through the load path.
+#: ``None`` means "not set by a server", and the env var decides -- which is what keeps the
+#: offline LLM API and the one-off scripts working.
+_VISION_OVERRIDE: bool | None = None
+
+
+def set_vision_enabled(enabled: bool) -> None:
+    """Pin the vision gate for this process. Called from the server's startup path."""
+    global _VISION_OVERRIDE
+    _VISION_OVERRIDE = bool(enabled)
+
+
 def vision_load_enabled() -> bool:
-    """Vision is opt-in (default OFF). The vision tower + multimodal embedder are ~1 GiB of
-    resident, never-quantized (bf16) GPU weights that text-only serving never touches, so we
-    skip building and loading them unless ``FREETOKEN_LOAD_VISION=1`` is set."""
+    """Vision is opt-in (default OFF). The vision tower is ~0.8 GiB of resident, never-quantized
+    (bf16) GPU weights that text-only serving never touches -- measured 0.832 GiB on
+    Ornith-1.5-35B-A3B-NVFP4, whose 333 visual tensors carry no quant scales at all. So it is
+    built and loaded only when asked for, via ``--vision`` or ``FREETOKEN_LOAD_VISION=1``."""
+    if _VISION_OVERRIDE is not None:
+        return _VISION_OVERRIDE
     return os.getenv("FREETOKEN_LOAD_VISION", "0").strip().lower() in _VISION_TRUE
 
 

@@ -932,6 +932,14 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    # The tokenizer worker probes the model family to decide whether to accept images; it runs
+    # in this process tree, so the gate has to be set here too (launch.py sets it for the
+    # scheduler process, which is the one that actually builds the tower).
+    from freetoken.models.config import set_vision_enabled
+
+    set_vision_enabled(config.vision)
+    if config.vision:
+        logger.info("Vision enabled: the checkpoint's vision tower will be built and loaded")
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(

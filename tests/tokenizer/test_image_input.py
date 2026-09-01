@@ -132,6 +132,7 @@ def test_unchunkable_multimodal_request_is_rejected_not_fatal():
 
     class _NoSwa:  # non-sliding-window cache: chunking is capped by token_budget alone
         swa_paged = False
+        prefill_chunk_align = 1  # no snapshot-boundary alignment to respect
 
     adder = PrefillAdder(
         token_budget=8192, reserved_size=0, cache_manager=_NoSwa(), table_manager=None
