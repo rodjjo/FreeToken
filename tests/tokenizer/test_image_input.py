@@ -237,12 +237,12 @@ def test_a_span_wider_than_one_chunk_is_rejected_not_fatal():
     REQUEST -- return None so the caller's release path runs, because raising from the
     chunker took the whole scheduler worker down."""
     pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
-    adder = _adder(8192, 20000)
+    adder = _adder(8192, 20000)  # span 10000 > 8192, the largest chunk this server schedules
     got = adder._add_one_req(
         pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
     )
     assert got is None
-    assert [uid for uid, _ in adder.rejected] == [9]
+    assert [uid for uid, _, _ in adder.rejected] == [9]
     reason = adder.rejected[0][1]
     assert "[100, 10100)" in reason and "cannot be split" in reason and "10000" in reason
 
@@ -276,13 +276,13 @@ def test_an_unlocatable_image_span_keeps_the_all_or_nothing_rule():
         pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
     )
     assert got is None, "must return None so the caller releases the pass's resources"
-    assert [uid for uid, _ in adder.rejected] == [9]
+    assert [uid for uid, _, _ in adder.rejected] == [9]
     reason = adder.rejected[0][1]
     assert "9383" in reason and "8192" in reason and "one prefill chunk" in reason
 
     mgr = PrefillManager(cache_manager=None, table_manager=None, decode_manager=None)
     mgr.rejections.extend(adder.rejected)
-    assert mgr.drain_rejections() == [(9, reason)]
+    assert mgr.drain_rejections() == [(9, reason, None)]
     assert mgr.drain_rejections() == [], "draining is one-shot"
 
 
@@ -343,3 +343,223 @@ def test_probe_failure_disables_images_rather_than_blocking_startup(monkeypatch)
     monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
     monkeypatch.setattr(weight_mod, "_spec_for_model_path", _boom)
     assert _image_processor_path("nonexistent/model") is None
+
+
+# ------------------------------------------------- budget: transient vs terminal
+def test_losing_this_passs_budget_race_declines_instead_of_rejecting():
+    """token_budget is the pass's REMAINDER -- earlier admissions in the same pass spend it.
+    A prompt whose span would fit a full chunk must not be killed for being second in line:
+    decline (None, stays queued) and let it retry at the front of the queue."""
+    pending = _pending(9383, img_at=slice(100, 5000), n_img=4900, tok_id=151655)
+    adder = _adder(8192, 9383)
+    adder.token_budget = 3000  # what an earlier admission this pass left behind
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is None
+    assert adder.rejected == [], "the span fits 8192; nothing about it is terminal"
+
+
+def test_a_span_over_the_full_budget_is_still_terminal():
+    """The other half: no pass can ever hold this one, so waiting is pointless."""
+    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    assert adder.max_chunk_budget == 8192
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is None
+    assert [uid for uid, _, _ in adder.rejected] == [9]
+    assert "largest chunk this server will schedule is 8192" in adder.rejected[0][1]
+
+
+def test_rejecting_a_continuation_hands_back_the_prior_chunk():
+    """Earlier chunks already forwarded: dropping the request from the queue leaves nobody to
+    return their KV pages, table row and GDN slots, so the rejection must carry the Req that
+    owns them. A first-chunk rejection has nothing to hand back (the adder released it)."""
+    pending = _pending(20000, img_at=slice(9000, 19000), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    prior = object()
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8192,
+        chunked_req=prior,
+    )
+    assert got is None
+    uid, _, handed_back = adder.rejected[0]
+    assert uid == 9 and handed_back is prior
+
+
+# --------------------------------------------- the batch-wide image-token count
+def test_a_stray_placeholder_in_another_request_cannot_break_this_one(monkeypatch):
+    """`<|image_pad|>` has a printable spelling and tokenizes straight to the image id, so a
+    plain text request can carry it. Under a batch-wide mask its tokens counted against the
+    image request's embeddings -- a mismatch inside the forward, which has no per-request
+    recovery, so one request's text took the whole worker down."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    img_req = SimpleNamespace(
+        uid=1, extend_len=6, mm_embeds=torch.full((2, 4), 9.0), mm_scatter=True)
+    text_req = SimpleNamespace(uid=2, extend_len=3, mm_embeds=None, mm_scatter=True)
+    # request 1: [t, IMG, IMG, t, t, t]   request 2 (attacker): [t, IMG, t]
+    input_ids = torch.tensor([5, IMG, IMG, 5, 5, 5, 7, IMG, 7])
+    x = torch.zeros(9, 4)
+    batch = SimpleNamespace(reqs=[img_req, text_req], mm_embeds=img_req.mm_embeds)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+
+    out = mod.Qwen3_5Model._merge_multimodal(SimpleNamespace(_image_token_id=IMG), input_ids, x)
+    assert out[1].tolist() == [9.0] * 4 and out[2].tolist() == [9.0] * 4
+    assert out[7].tolist() == [0.0] * 4, "the other request's placeholder is left alone"
+
+
+def test_a_count_mismatch_raises_rather_than_asserts(monkeypatch):
+    """`python -O` strips asserts, and what follows a stripped one is masked_scatter quietly
+    taking the wrong number of rows."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.zeros(2, 4), mm_scatter=True)
+    batch = SimpleNamespace(reqs=[req], mm_embeds=req.mm_embeds)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    with pytest.raises(RuntimeError, match="image-token slots"):
+        mod.Qwen3_5Model._merge_multimodal(
+            SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, 5, 5]), torch.zeros(3, 4)
+        )
+
+
+def test_a_chunk_that_does_not_scatter_is_skipped_entirely(monkeypatch):
+    """mm_embeds stays set on every chunk (the cache manager reads it as 'keep this out of the
+    shared prefix cache'), so mm_scatter is what must gate the scatter."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.ones(2, 4), mm_scatter=False)
+    batch = SimpleNamespace(reqs=[req], mm_embeds=req.mm_embeds)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    out = mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 4)
+    )
+    assert out.abs().sum() == 0
+
+
+# ------------------------------------------------------- the other render paths
+def test_the_image_path_quantizes_reasoning_effort_like_every_other_path():
+    """render_prompt sanitizes reasoning_effort; encode_multimodal must too, or an
+    unsupported value renders differently depending on whether the request had an image."""
+    from types import SimpleNamespace
+
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    seen = {}
+
+    class _Proc:
+        def apply_chat_template(self, messages, **kw):
+            seen.update(kw)
+            return "PROMPT"
+
+        def __call__(self, text, images, return_tensors):
+            import torch
+
+            return {"input_ids": torch.zeros(1, 3, dtype=torch.long),
+                    "pixel_values": torch.zeros(1, 2, 2)}
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = _Proc()
+    mgr._processor_lock = __import__("threading").Lock()
+    mgr._processor_path = "unused"
+    mgr._logged_effort_maps = set()
+    from freetoken.tokenizer.effort import EffortProfile
+
+    mgr.effort_profile = lambda: EffortProfile(
+        supported=frozenset({"low", "high"}), default="low",
+        consumes_effort=True, validates=True,
+    )
+
+    import io as _io
+
+    from PIL import Image as _Image
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    msg = SimpleNamespace(chat_template_kwargs={"reasoning_effort": "ludicrous"}, tools=None)
+    mgr.encode_multimodal(msg, [{"role": "user", "content": "x"}], [buf.getvalue()])
+    assert seen.get("reasoning_effort") != "ludicrous", seen
+
+
+def test_the_tokenize_worker_still_carries_inference_mode():
+    """The decorator sat on tokenize_worker until a helper was inserted between them, which
+    silently moved every worker tokenization out of inference_mode."""
+    import freetoken.tokenizer.server as srv
+
+    assert hasattr(srv.tokenize_worker, "__wrapped__"), (
+        "tokenize_worker lost @torch.inference_mode()"
+    )
+    assert not hasattr(srv._image_processor_path, "__wrapped__"), (
+        "the decorator landed on the helper instead"
+    )
+
+
+def test_no_image_support_is_a_client_error_not_a_server_fault():
+    """count_tokens has no per-request isolation to fall back on, so 'this deployment has no
+    vision tower' has to be distinguishable from 'the processor failed to load'."""
+    from freetoken.tokenizer.tokenize import ImageInputUnsupported, TokenizeManager
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = None
+    mgr._processor_lock = __import__("threading").Lock()
+    mgr._processor_path = None
+    with pytest.raises(ImageInputUnsupported):
+        mgr._processor()
+    assert issubclass(ImageInputUnsupported, ValueError), "callers still catch ValueError"
+
+
+def test_a_literal_placeholder_in_the_text_names_itself_in_the_error():
+    """transformers raises StopIteration when the text has more placeholders than images, and
+    str(StopIteration()) is empty -- the client got 'could not encode request: ' and nothing
+    else. Catch it before the processor and say what is wrong."""
+    import io as _io
+    import threading as _threading
+    from types import SimpleNamespace
+
+    from PIL import Image as _Image
+
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    class _Proc:
+        image_token = "<|image_pad|>"
+
+        def apply_chat_template(self, messages, **kw):
+            return "user: <|image_pad|> and a literal <|image_pad|> <|image_pad|>"
+
+        def __call__(self, *a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("the pre-check should have fired first")
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = _Proc()
+    mgr._processor_lock = _threading.Lock()
+    mgr._processor_path = "unused"
+    mgr._logged_effort_maps = set()
+    mgr.effort_profile = lambda: None
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    msg = SimpleNamespace(chat_template_kwargs=None, tools=None)
+    with pytest.raises(ValueError, match=r"2 literal .*image_pad"):
+        mgr.encode_multimodal(msg, [{"role": "user", "content": "x"}], [buf.getvalue()])
+
+
+def test_a_messageless_exception_still_says_something():
+    """`f"{exc or exc!r}"` applies !r to the WHOLE expression, so it reads repr() even for a
+    normal exception. The client should see the message when there is one, the type when
+    there is not."""
+    assert (lambda e: str(e) or repr(e))(ValueError("boom")) == "boom"
+    assert (lambda e: str(e) or repr(e))(StopIteration()) == "StopIteration()"

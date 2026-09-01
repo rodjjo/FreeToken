@@ -86,23 +86,43 @@ class Qwen3_5Model(BaseOP):
     def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Overwrite the embeddings at image-token positions with the vision tower's output.
 
-        ``batch.mm_embeds`` is set by the scheduler (which owns the model, so it is the only
-        place that can run the tower) and is already ``[num_soft_tokens, hidden]``. Text-only
-        batches -- every decode step, and every prefill without an image -- take the early
-        return, so this costs one attribute read there.
+        Scatters PER REQUEST, over that request's own slice of the batch. A batch-wide mask
+        would count every image token in the forward against one concatenated tensor -- and
+        the image token has a printable spelling (``<|image_pad|>`` tokenizes straight to
+        248056 on Qwen3-VL), so any other request in the batch could add to that count just by
+        containing the string. That made one request's text able to break another's prefill,
+        and the mismatch surfaces inside the forward, where there is no per-request recovery.
+
+        ``req.mm_embeds`` is set by the scheduler (which owns the model, so it is the only
+        place that can run the tower); ``req.mm_scatter`` says whether THIS chunk is the one
+        holding the image tokens. Text-only batches -- every decode step, and every prefill
+        without an image -- take the early return.
         """
         if self._image_token_id is None:
             return x
-        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
-        if mm_embeds is None:
-            return x
-        mask = input_ids == self._image_token_id
-        n_slots = int(mask.sum())
-        assert n_slots == mm_embeds.shape[0], (
-            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
-            "the processor's token expansion and the tower's output disagree"
-        )
-        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+        batch = get_global_ctx().batch
+        if getattr(batch, "mm_embeds", None) is None:
+            return x  # nothing in this batch scatters; skip the per-request walk
+        offset = 0
+        for req in batch.reqs:
+            n = req.extend_len
+            embeds = req.mm_embeds if getattr(req, "mm_scatter", True) else None
+            if embeds is not None:
+                span = slice(offset, offset + n)
+                mask = input_ids[span] == self._image_token_id
+                n_slots = int(mask.sum())
+                # A raise, not an assert: `python -O` strips asserts, and what follows a
+                # stripped one here is masked_scatter silently taking the wrong number of
+                # rows -- one request's image landing in another's tokens.
+                if n_slots != embeds.shape[0]:
+                    raise RuntimeError(
+                        f"request {req.uid}: image-token slots ({n_slots}) != vision features "
+                        f"({embeds.shape[0]}); the processor's token expansion and the tower's "
+                        "output disagree"
+                    )
+                x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
+            offset += n
+        return x
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)

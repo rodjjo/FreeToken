@@ -119,6 +119,13 @@ def split_image_parts(
     return out, images
 
 
+class ImageInputUnsupported(ValueError):
+    """This deployment cannot accept images at all -- a CLIENT error (400), unlike a
+    processor that exists but fails to load (a server fault, 500). Separated because
+    /v1/messages/count_tokens has no per-request isolation to fall back on: without this
+    distinction an agent client asking to count an image-bearing turn got a 500."""
+
+
 class TokenizeManager:
     def __init__(
         self, tokenizer: PreTrainedTokenizerBase, processor_path: str | None = None
@@ -140,7 +147,7 @@ class TokenizeManager:
         with self._processor_lock:
             if self._processor_obj is None:
                 if self._processor_path is None:
-                    raise ValueError(
+                    raise ImageInputUnsupported(
                         "this model does not accept image input: either its family has "
                         "no vision tower here, or vision is off (pass --vision), or the "
                         "checkpoint has no processor config"
@@ -173,12 +180,29 @@ class TokenizeManager:
         from PIL import Image
 
         proc = self._processor()
-        chat_template_kwargs = dict(msg.chat_template_kwargs or {})
+        # Same effort quantization every other render path applies (render_prompt ->
+        # _sanitize_effort). Skipping it here would make an unsupported reasoning_effort
+        # render differently depending on whether the request happened to carry an image.
+        chat_template_kwargs = dict(self._sanitize_effort(dict(msg.chat_template_kwargs or {})))
         if msg.tools is not None:
             chat_template_kwargs["tools"] = msg.tools
         prompt = proc.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, **chat_template_kwargs
         )
+        # The template emits exactly one placeholder per image block; any extra one came from
+        # the request's own TEXT, because the placeholder has a printable spelling
+        # (`<|image_pad|>`). Left alone, the processor runs out of images mid-expansion and
+        # raises StopIteration -- whose str() is empty, so the client got
+        # "could not encode request: " and nothing else. Say what is actually wrong.
+        marker = getattr(proc, "image_token", None)
+        if isinstance(marker, str) and marker:
+            extra = prompt.count(marker) - len(images)
+            if extra > 0:
+                raise ValueError(
+                    f"prompt text contains {extra} literal {marker!r} token(s) beyond its "
+                    f"{len(images)} image(s); remove them (the image placeholder is reserved "
+                    "for the processor's own expansion)"
+                )
         pil = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
         enc = proc(text=[prompt], images=pil, return_tensors="pt")
         return (

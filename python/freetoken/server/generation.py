@@ -23,7 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.tokenize import ImageInputUnsupported, resolve_thinking_mode
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -323,6 +323,11 @@ async def count_prompt_tokens(
     try:
         input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
     except _TemplateError as exc:
+        raise GenerationError(str(exc)) from exc
+    except ImageInputUnsupported as exc:
+        # The conversation carries an image and this deployment has no vision tower. Input
+        # driven, so a 400 like every other unservable-prompt failure -- not the 500 that a
+        # tokenizer *initialization* fault gets.
         raise GenerationError(str(exc)) from exc
     return int(input_ids.numel())
 

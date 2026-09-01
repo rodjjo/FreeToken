@@ -92,6 +92,7 @@ class Scheduler(SchedulerIOMixin):
         # None (text-only build) keeps the conservative "whole prompt in one chunk" rule.
         mc = config.model_config
         image_token_id = mc.image_token_id if getattr(mc, "is_multimodal", False) else None
+        self.image_token_id = image_token_id
         self.prefill_manager = PrefillManager(
             self.cache_manager,
             self.table_manager,
@@ -864,7 +865,22 @@ class Scheduler(SchedulerIOMixin):
                 "request carries pixel_values with neither image_grid_thw nor "
                 "image_position_ids; the tokenizer's processor produced no geometry"
             )
-        return encode(msg.pixel_values.to(device), geometry.to(device))
+        embeds = encode(msg.pixel_values.to(device), geometry.to(device))
+        # The model scatters these into every image-token position it sees, so the two counts
+        # must already agree HERE, where a mismatch is still a per-request error the caller
+        # turns into one error reply. Reaching the forward with a mismatch is unrecoverable:
+        # the scatter is inside the batch, so it would take the whole worker down -- and the
+        # image token has a printable spelling (`<|image_pad|>` -> 248056 on Qwen3-VL), so a
+        # request can put extra ones in its own text just by typing them.
+        if self.image_token_id is not None:
+            n_slots = int((msg.input_ids == self.image_token_id).sum())
+            if n_slots != embeds.shape[0]:
+                raise RuntimeError(
+                    f"prompt has {n_slots} image-token placeholders but the vision tower "
+                    f"produced {embeds.shape[0]} embeddings; if the text contains a literal "
+                    f"image placeholder token, remove it"
+                )
+        return embeds
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
@@ -885,10 +901,15 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
-        for uid, reason in self.prefill_manager.drain_rejections():
+        for uid, reason, prior_chunk in self.prefill_manager.drain_rejections():
             # Requests the prefill manager found unschedulable no matter how long they wait
-            # (today: a multimodal prompt that cannot fit one chunk). Terminal for that
-            # request only -- the loop keeps running.
+            # (today: a multimodal prompt whose image tokens outrun the largest chunk this
+            # server schedules). Terminal for that request only -- the loop keeps running.
+            if prior_chunk is not None:
+                # Rejected mid-prompt: earlier chunks already forwarded, and dropping the
+                # request from the queue leaves nobody to return their KV pages, table row
+                # and GDN slots. Same release an abort does.
+                self._free_req_resources(prior_chunk)
             logger.warning_rank0("Dropping request %d: %s", uid, reason)
             self.send_result([ErrorReplyMsg(uid=uid, error=reason, code="context_length_exceeded")])
         if batch is None:

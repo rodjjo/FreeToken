@@ -209,7 +209,16 @@ class FrontendManager:
                 from freetoken.tokenizer.tokenize import TokenizeManager
                 from freetoken.utils import load_tokenizer
 
-                self._frontend_tokenizer = TokenizeManager(load_tokenizer(self.config.model_path))
+                # Same processor probe the tokenizer worker runs: /v1/messages/count_tokens
+                # goes through this manager, and an image-bearing conversation reaches
+                # encode_multimodal, which needs the processor. Without it a --vision server
+                # answered 500 on the one endpoint an agent client calls before every turn.
+                from freetoken.tokenizer.server import _image_processor_path
+
+                path = self.config.model_path
+                self._frontend_tokenizer = TokenizeManager(
+                    load_tokenizer(path), processor_path=_image_processor_path(path)
+                )
             return self._frontend_tokenizer
 
     def warm_frontend_tokenizer(self) -> None:

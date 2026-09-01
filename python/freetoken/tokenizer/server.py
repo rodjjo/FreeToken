@@ -99,12 +99,16 @@ def _tokenize_requests(
             tokens, mm = tokenize_manager.encode([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
+            # Some exceptions carry no message at all -- transformers raises a bare
+            # StopIteration when a prompt has more image placeholders than images, and
+            # str() of that is "", which reached the client as "could not encode request: ".
+            detail = str(exc) or repr(exc)
             errors.append(
                 UserReply(
                     uid=msg.uid,
                     incremental_output="",
                     finished=True,
-                    error=f"could not encode request: {exc}",
+                    error=f"could not encode request: {detail}",
                 )
             )
             continue
@@ -125,7 +129,6 @@ def _tokenize_requests(
     return ok_msgs, ok_tensors, errors
 
 
-@torch.inference_mode()
 def _image_processor_path(tokenizer_path: str) -> str | None:
     """The local checkpoint dir to load an image processor from, or None.
 
@@ -151,6 +154,7 @@ def _image_processor_path(tokenizer_path: str) -> str | None:
     return None
 
 
+@torch.inference_mode()
 def tokenize_worker(
     *,
     tokenizer_path: str,
