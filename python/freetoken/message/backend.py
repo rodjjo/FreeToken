@@ -43,6 +43,7 @@ class UserMsg(BaseBackendMsg):
     # ``[num_images, num_patches, 3*patch**2]`` and ``[num_images, num_patches, 2]``.
     pixel_values: torch.Tensor | None = None
     image_position_ids: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
 
 
 @dataclass

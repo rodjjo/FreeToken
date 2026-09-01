@@ -60,8 +60,16 @@ class MultimodalInputs:
     backend queue rather than being recomputed on the other side.
     """
 
-    pixel_values: torch.Tensor  # [num_images, num_patches, 3*patch**2]
-    image_position_ids: torch.Tensor  # [num_images, num_patches, 2]
+    #: The processor's own pixel layout, passed to the model untouched. gemma-4 gives
+    #: ``[num_images, num_patches, 3*patch**2]``; Qwen3-VL packs every image's patches into one
+    #: ``[total_patches, 3*temporal*patch**2]`` and describes the split in ``image_grid_thw``.
+    pixel_values: torch.Tensor
+    #: The geometry the model needs to place those patches, in whichever form its processor
+    #: emits: gemma-4's ``image_position_ids`` ``[num_images, num_patches, 2]``, or Qwen3-VL's
+    #: ``image_grid_thw`` ``[num_images, 3]``. Exactly one is set; the model's
+    #: ``encode_images`` knows which one it asked for.
+    image_position_ids: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
 
 
 def _decode_data_url(url: str) -> bytes:
@@ -133,11 +141,9 @@ class TokenizeManager:
             if self._processor_obj is None:
                 if self._processor_path is None:
                     raise ValueError(
-                        "this model does not accept image input: either its family is "
-                        "served text-only here (only gemma-4 has a vision tower today -- "
-                        "qwen3_5_moe/Ornith ships processor files but is text-only), or "
-                        "vision is off (set FREETOKEN_LOAD_VISION=1), or the checkpoint "
-                        "has no processor config"
+                        "this model does not accept image input: either its family has "
+                        "no vision tower here, or vision is off (pass --vision), or the "
+                        "checkpoint has no processor config"
                     )
                 try:
                     from transformers import AutoProcessor
@@ -179,7 +185,10 @@ class TokenizeManager:
             enc["input_ids"][0].view(-1).to(torch.int32),
             MultimodalInputs(
                 pixel_values=enc["pixel_values"],
-                image_position_ids=enc["image_position_ids"],
+                # Whichever the checkpoint's processor produced. Neither key is universal:
+                # gemma-4 has no grid_thw, Qwen3-VL has no position_ids.
+                image_position_ids=enc.get("image_position_ids"),
+                image_grid_thw=enc.get("image_grid_thw"),
             ),
         )
 

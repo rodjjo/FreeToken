@@ -842,13 +842,22 @@ class Scheduler(SchedulerIOMixin):
         if encode is None:
             raise RuntimeError(
                 f"{type(model).__name__} was built without a vision tower -- this model "
-                "family is served text-only, or FREETOKEN_LOAD_VISION was not set when it "
+                "family has no vision tower here, or --vision was not passed when it "
                 "was loaded"
             )
         device = self.engine.device
-        return encode(
-            msg.pixel_values.to(device), msg.image_position_ids.to(device)
-        )
+        # Processors disagree on how they describe an image's geometry -- gemma-4 emits
+        # image_position_ids, Qwen3-VL emits image_grid_thw -- and the tokenizer forwards
+        # whichever its own processor produced. Hand over the one that is set; a model whose
+        # encode_images wants the other signature fails loudly here rather than silently
+        # reading zeros.
+        geometry = msg.image_grid_thw if msg.image_grid_thw is not None else msg.image_position_ids
+        if geometry is None:
+            raise RuntimeError(
+                "request carries pixel_values with neither image_grid_thw nor "
+                "image_position_ids; the tokenizer's processor produced no geometry"
+            )
+        return encode(msg.pixel_values.to(device), geometry.to(device))
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
