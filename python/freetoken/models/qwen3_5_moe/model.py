@@ -101,7 +101,7 @@ class Qwen3_5Model(BaseOP):
         if self._image_token_id is None:
             return x
         batch = get_global_ctx().batch
-        if getattr(batch, "mm_embeds", None) is None:
+        if not getattr(batch, "has_images", False):
             return x  # nothing in this batch scatters; skip the per-request walk
         offset = 0
         for req in batch.reqs:

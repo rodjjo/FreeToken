@@ -407,7 +407,7 @@ def test_a_stray_placeholder_in_another_request_cannot_break_this_one(monkeypatc
     # request 1: [t, IMG, IMG, t, t, t]   request 2 (attacker): [t, IMG, t]
     input_ids = torch.tensor([5, IMG, IMG, 5, 5, 5, 7, IMG, 7])
     x = torch.zeros(9, 4)
-    batch = SimpleNamespace(reqs=[img_req, text_req], mm_embeds=img_req.mm_embeds)
+    batch = SimpleNamespace(reqs=[img_req, text_req], has_images=True)
     monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
 
     out = mod.Qwen3_5Model._merge_multimodal(SimpleNamespace(_image_token_id=IMG), input_ids, x)
@@ -425,7 +425,7 @@ def test_a_count_mismatch_raises_rather_than_asserts(monkeypatch):
 
     IMG = 151655
     req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.zeros(2, 4), mm_scatter=True)
-    batch = SimpleNamespace(reqs=[req], mm_embeds=req.mm_embeds)
+    batch = SimpleNamespace(reqs=[req], has_images=True)
     monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
     with pytest.raises(RuntimeError, match="image-token slots"):
         mod.Qwen3_5Model._merge_multimodal(
@@ -443,7 +443,7 @@ def test_a_chunk_that_does_not_scatter_is_skipped_entirely(monkeypatch):
 
     IMG = 151655
     req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.ones(2, 4), mm_scatter=False)
-    batch = SimpleNamespace(reqs=[req], mm_embeds=req.mm_embeds)
+    batch = SimpleNamespace(reqs=[req], has_images=True)
     monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
     out = mod.Qwen3_5Model._merge_multimodal(
         SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 4)
@@ -563,3 +563,47 @@ def test_a_messageless_exception_still_says_something():
     there is not."""
     assert (lambda e: str(e) or repr(e))(ValueError("boom")) == "boom"
     assert (lambda e: str(e) or repr(e))(StopIteration()) == "StopIteration()"
+
+
+# --------------------------------------------------- the same hole in gemma4
+def test_gemma4_also_scatters_per_request(monkeypatch):
+    """gemma4 carried the identical batch-wide mask and assert. It is a separate model file,
+    so the qwen3_5_moe fix does not reach it -- and the failure mode is the same worker kill."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.gemma4.model as g4
+
+    IMG = 262144
+    img_req = SimpleNamespace(
+        uid=1, extend_len=4, mm_embeds=torch.full((2, 3), 7.0), mm_scatter=True)
+    text_req = SimpleNamespace(uid=2, extend_len=2, mm_embeds=None, mm_scatter=True)
+    input_ids = torch.tensor([1, IMG, IMG, 1, 2, IMG])
+    batch = SimpleNamespace(reqs=[img_req, text_req], has_images=True)
+    monkeypatch.setattr(g4, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+
+    out = g4.Gemma4Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), input_ids, torch.zeros(6, 3)
+    )
+    assert out[1].tolist() == [7.0] * 3 and out[2].tolist() == [7.0] * 3
+    assert out[5].tolist() == [0.0] * 3, "the other request's placeholder is left alone"
+
+
+def test_a_text_only_batch_never_walks_the_requests(monkeypatch):
+    """has_images is the whole point of the flag: every decode step and every text prefill
+    must take the early return rather than iterate the batch."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    class _Boom(list):
+        def __iter__(self):  # pragma: no cover - must not be reached
+            raise AssertionError("a text-only batch must not walk its requests")
+
+    batch = SimpleNamespace(reqs=_Boom(), has_images=False)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    x = torch.zeros(3, 4)
+    assert mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=5), torch.tensor([1, 2, 3]), x
+    ) is x

@@ -181,9 +181,15 @@ class TokenizeManager:
 
         proc = self._processor()
         # Same effort quantization every other render path applies (render_prompt ->
-        # _sanitize_effort). Skipping it here would make an unsupported reasoning_effort
-        # render differently depending on whether the request happened to carry an image.
+        # _sanitize_effort): an unsupported reasoning_effort must not render differently
+        # just because the request happened to carry an image.
         chat_template_kwargs = dict(self._sanitize_effort(dict(msg.chat_template_kwargs or {})))
+        # ...and the same reasoning_strength broadcast (_render): a template reading only that
+        # spelling would otherwise see no effort at all once the request carried an image.
+        if "reasoning_effort" in chat_template_kwargs:
+            chat_template_kwargs.setdefault(
+                "reasoning_strength", chat_template_kwargs["reasoning_effort"]
+            )
         if msg.tools is not None:
             chat_template_kwargs["tools"] = msg.tools
         prompt = proc.apply_chat_template(

@@ -138,8 +138,10 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
-    mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Whether any request in this prefill batch scatters image features. The features
+    # themselves live on the requests (Req.mm_embeds): the models scatter per request, so a
+    # concatenated batch-wide copy would be allocated on every image prefill and never read.
+    has_images: bool = field(default=False, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

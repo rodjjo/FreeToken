@@ -883,17 +883,15 @@ class Scheduler(SchedulerIOMixin):
         return embeds
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
+        """Flag a prefill batch that carries images, so the model's per-request scatter runs
+        at all (every decode step and every text prefill skips it). ``req.mm_embeds``
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
         carry per-image content) -- ``req.mm_scatter`` is what says whether this particular
         chunk is the one holding the image tokens."""
-        parts = [
-            req.mm_embeds for req in batch.reqs if req.mm_embeds is not None and req.mm_scatter
-        ]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        batch.has_images = any(
+            req.mm_embeds is not None and req.mm_scatter for req in batch.reqs
+        )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
