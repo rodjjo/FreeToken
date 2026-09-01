@@ -88,8 +88,15 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Lets a chunked prefill split a multimodal prompt anywhere the image tokens are not;
+        # None (text-only build) keeps the conservative "whole prompt in one chunk" rule.
+        mc = config.model_config
+        image_token_id = mc.image_token_id if getattr(mc, "is_multimodal", False) else None
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            image_token_id=image_token_id,
         )
 
         # some alias for easy access
@@ -864,8 +871,11 @@ class Scheduler(SchedulerIOMixin):
         batch so the model can scatter them at image-token positions. ``req.mm_embeds``
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
+        carry per-image content) -- ``req.mm_scatter`` is what says whether this particular
+        chunk is the one holding the image tokens."""
+        parts = [
+            req.mm_embeds for req in batch.reqs if req.mm_embeds is not None and req.mm_scatter
+        ]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)
 

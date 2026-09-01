@@ -127,6 +127,7 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        span = pending_req.mm_span if pending_req.mm_embeds is not None else None
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -166,23 +167,64 @@ class PrefillAdder:
             # the request until it gets a bigger turn.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
+        # A chunk boundary must not cut the IMAGE-TOKEN span: the model scatters the whole of
+        # mm_embeds into the image tokens one forward sees, and asserts the counts match. That
+        # is the ONLY constraint -- the rest of the prompt chunks freely, which is what stops a
+        # 200-token sprite forcing its 166k-token agent turn into a single prefill.
+        #
+        # Runs after all the sizing above (token budget, swa pool, chunk alignment), because any
+        # of them can be what puts the boundary inside the span. Pulling the end back to just
+        # before the span leaves reserved_swa describing a slightly larger chunk than we take --
+        # the same over-reservation the alignment step above already makes, and conservative.
         is_chunked = chunk_size < remain_len
-        if is_chunked and pending_req.mm_embeds is not None:
-            # A multimodal prompt cannot be split: the model asserts that every image
-            # token's soft embedding is in the same forward. Retrying cannot make the chunk
-            # bigger, so this is terminal for the request -- record it and return None so
-            # the caller's normal release path frees what this pass allocated. Raising here
-            # instead would take the scheduler worker (and the server) down.
-            self.rejected.append(
-                (
-                    pending_req.uid,
-                    f"prompt with images needs {remain_len} tokens in one prefill chunk but "
-                    f"only {chunk_size} fit; raise --max-prefill-length, and for a "
-                    f"sliding-window model the window pool caps it further "
-                    f"(--swa-num-pages-override / --kv-reserve-tokens)",
+        mm_scatter = True
+        # Gated on this forward not covering the WHOLE prompt, not on `is_chunked`: the LAST
+        # chunk of a chunked prompt has chunk_size == remain_len, so is_chunked is False there
+        # and the default mm_scatter=True would scatter 196 features into 0 image-token slots.
+        covers_whole_prompt = cached_len == 0 and not is_chunked
+        if not covers_whole_prompt and pending_req.mm_embeds is not None:
+            if span is None:
+                # Images the adder cannot locate -- no image_token_id (text-only build), or a
+                # prompt whose placeholder expansion never happened. Refuse to guess and keep
+                # the old all-or-nothing rule: the whole prompt in one chunk, or nothing.
+                lo, hi = 0, pending_req.input_len
+            else:
+                lo, hi = span
+            end = cached_len + chunk_size
+            if lo < end < hi and lo > cached_len and hi - lo <= chunk_size:
+                # End just before the span instead, so it rides the NEXT chunk whole. Gated on
+                # the span FITTING a chunk this size: pulling back for a span that can never
+                # fit would spend a chunk of prefill and then reject on the following pass,
+                # reporting the same terminal error one pass later than it is known.
+                # Keep both alignments the sizing above established (page-aligned swa
+                # boundary, snapshot boundary); 0 after that means no whole unit fits -> fall
+                # through to the rejection, which is also what a retry would decide.
+                unit = max(self.cache_manager.prefill_chunk_align, 1)
+                if self.cache_manager.swa_paged:
+                    unit = max(unit, self.cache_manager.page_size)
+                pulled = align_down(lo, unit) - cached_len
+                if pulled > 0:
+                    chunk_size = pulled
+                    end = cached_len + chunk_size
+            # Left over: the span itself outgrows one chunk, or a previous pass already cut it.
+            # Terminal for the request -- retrying cannot make the chunk bigger. Return None
+            # rather than raise; raising here took the whole scheduler worker down.
+            if lo < end < hi or lo < cached_len < hi:
+                self.rejected.append(
+                    (
+                        pending_req.uid,
+                        f"prompt with images needs {hi - lo} contiguous tokens in one prefill "
+                        f"chunk (the image tokens span [{lo}, {hi}) and cannot be split) but "
+                        f"only {chunk_size} fit; raise --max-prefill-length, and for a "
+                        f"sliding-window model the window pool caps it further "
+                        f"(--swa-num-pages-override / --kv-reserve-tokens)",
+                    )
                 )
-            )
-            return None
+                return None
+            # Only the chunk holding the span scatters. The others keep mm_embeds set -- the
+            # cache manager reads it as "image placeholders share a token id, keep this out of
+            # the shared prefix cache" -- but scattering there would find zero image tokens.
+            mm_scatter = cached_len <= lo and hi <= end
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -199,6 +241,7 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            mm_scatter=mm_scatter,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -259,6 +302,9 @@ class PrefillManager:
     # Terminal (uid, reason) pairs produced by the last scheduling pass; the scheduler
     # drains them into error replies.
     rejections: List[Tuple[int, str]] = field(default_factory=list)
+    #: The model's image token id, so a chunked multimodal prompt can be split anywhere the
+    #: image tokens are not. None on a text-only build, which restores the all-or-nothing rule.
+    image_token_id: int | None = None
 
     def drain_rejections(self) -> List[Tuple[int, str]]:
         out, self.rejections = self.rejections, []
@@ -266,7 +312,13 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                image_token_id=self.image_token_id,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
