@@ -33,7 +33,9 @@ from dataclasses import dataclass
 
 from .index import num_splits_for
 
-KV_CACHE_DTYPE_BYTES = 2  # every current model allocates bf16 paged KV
+# The AOT memcpy descriptors cover the native BF16 KV path. Dynamically scaled
+# FP8 KV uses its dedicated Triton store kernel instead.
+KV_CACHE_DTYPE_BYTES = 2
 EMBED_DTYPE_BYTES = 2  # embedding weights stay bf16 on the indexing() path
 
 

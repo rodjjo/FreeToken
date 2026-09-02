@@ -227,6 +227,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp8_e4m3"],
+        help=(
+            "Paged KV-cache storage dtype. 'auto' keeps the model compute dtype; "
+            "'fp8_e4m3' enables dynamically scaled E4M3 KV storage on the supported "
+            "Qwen/Triton/SM89+ path."
+        ),
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -722,6 +734,10 @@ def parse_args(
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+    kv_dtype_str = kwargs["kv_cache_dtype"]
+    kwargs["kv_cache_dtype"] = (
+        None if kv_dtype_str == "auto" else torch.float8_e4m3fn
+    )
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

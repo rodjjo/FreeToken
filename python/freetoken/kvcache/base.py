@@ -9,6 +9,18 @@ from freetoken.utils import div_even, init_logger, mem_GB
 
 logger = init_logger(__name__)
 
+FP8_KV_DTYPE = torch.float8_e4m3fn
+FP8_KV_SCALE_DTYPE = torch.float32
+
+
+def resolved_kv_cache_dtype(config) -> torch.dtype:
+    """Storage dtype for paged K/V, independent of the model compute dtype."""
+    return getattr(config, "kv_cache_dtype", None) or config.dtype
+
+
+def is_fp8_kv_dtype(dtype: torch.dtype) -> bool:
+    return dtype == FP8_KV_DTYPE
+
 
 class CacheRebuildRejected(Exception):
     """A runtime cache rebuild was rejected BEFORE any destructive free (e.g. the
@@ -17,21 +29,32 @@ class CacheRebuildRejected(Exception):
 
 
 def spec_kv_bytes_per_token(spec, config) -> int:
-    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
+    """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x
+    storage-dtype x layers, plus the FP32 per-token quant-scale rows when the KV cache is
+    fp8, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
     hardcodes; keep the two in lockstep if the slab dtype ever changes.)
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    cache_dtype = resolved_kv_cache_dtype(config)
+    slabs = 1 if spec.mla else 2
+    local_heads = div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
     per_token = (
-        (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
+        slabs  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
-        * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * local_heads
+        * cache_dtype.itemsize
         * spec.num_layers
     )
+    if is_fp8_kv_dtype(cache_dtype):
+        # Dynamic symmetric quantization stores one FP32 scale per token, local
+        # KV head, layer and slab. Calibration/static scales are intentionally
+        # not part of this first implementation.
+        per_token += (
+            slabs * local_heads * FP8_KV_SCALE_DTYPE.itemsize * spec.num_layers
+        )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
 
 
@@ -144,6 +167,14 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def v_cache(self, index: int) -> torch.Tensor: ...
+
+    def k_scale(self, index: int) -> torch.Tensor | None:
+        """Optional dequant scale rows for quantized K storage."""
+        return None
+
+    def v_scale(self, index: int) -> torch.Tensor | None:
+        """Optional dequant scale rows for quantized V storage."""
+        return None
 
     @abstractmethod
     def store_kv(

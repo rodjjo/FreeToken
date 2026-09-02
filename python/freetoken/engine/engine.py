@@ -16,7 +16,15 @@ from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
 from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    init_logger,
+    is_arch_supported,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -352,8 +360,9 @@ class Engine:
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
+        kv_dtype = config.kv_cache_dtype or self.dtype
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+            config, self.num_pages, device=self.device, dtype=kv_dtype
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
@@ -1162,6 +1171,7 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     if moe_wfmt != "mxfp4" and not compiled_extension_supports(act):
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
+
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
@@ -1235,6 +1245,7 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    kv_cache_dtype = getattr(config, "kv_cache_dtype", None)
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1296,6 +1307,46 @@ def _adjust_config(config: EngineConfig):
             "cache_type",
             _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
+
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        # First milestone: the dynamically-scaled FP8 cache is deliberately narrow.
+        # Keep unsupported combinations from failing after the model is resident or,
+        # worse, silently reaching a backend that interprets the scale-less tensor.
+        if getattr(model_config, "model_type", None) != "qwen3_5_moe":
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 currently supports only the "
+                "Qwen3.5/Qwen3.6 model family."
+            )
+        if config.dtype != torch.bfloat16:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 currently requires --dtype bfloat16."
+            )
+        if config.tp_info.size != 1:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 currently requires tensor parallel size 1."
+            )
+        if not is_arch_supported(8, 9):
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 requires NVIDIA compute capability 8.9 "
+                "or newer for native E4M3 Triton loads."
+            )
+        if config.attention_backend == "auto":
+            override("attention_backend", "triton")
+            logger.info_rank0(
+                "FP8 KV cache selected: auto attention backend resolved to 'triton'"
+            )
+        if any(part.strip() != "triton" for part in config.attention_backend.split(",")):
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 currently requires "
+                "--attention-backend triton for both prefill and decode."
+            )
+        from freetoken.kvcache.mha_pool import MHAKVCache
+
+        if resolve_pool_class(model_config) is not MHAKVCache:
+            raise ValueError(
+                "--kv-cache-dtype fp8_e4m3 currently supports only the ordinary "
+                "paged MHA KV pool."
+            )
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every
@@ -1523,6 +1574,7 @@ def _adjust_config(config: EngineConfig):
     # hit an "Auto-selected ..." log at all).
     resolved = [
         f"attention_backend={config.attention_backend!r}",
+        f"kv_cache_dtype={(kv_cache_dtype or config.dtype)!r}",
         f"cache_type={getattr(config, 'cache_type', 'radix')!r}",
         f"page_size={config.page_size}",
     ]

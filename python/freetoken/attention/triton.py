@@ -151,10 +151,14 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
+        k_scale_raw = getattr(self.kvcache, "k_scale", lambda _layer: None)(layer_id)
+        v_scale_raw = getattr(self.kvcache, "v_scale", lambda _layer: None)(layer_id)
         kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
         assert head_dim == q.shape[-1]
         k_cache = k_raw.view(-1, kv_heads, head_dim)
         v_cache = v_raw.view(-1, kv_heads, head_dim)
+        k_scale = None if k_scale_raw is None else k_scale_raw.view(-1, kv_heads)
+        v_scale = None if v_scale_raw is None else v_scale_raw.view(-1, kv_heads)
 
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
@@ -181,6 +185,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         if (
             (not metadata.is_decode)
@@ -201,6 +207,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_extend=k.view(q.shape[0], kv_heads, head_dim),
                 v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         return paged_attention(
             q=q,
@@ -213,6 +221,8 @@ class TritonAttentionBackend(BaseAttnBackend):
             sm_scale=scale,
             sliding_window=spec.sliding_window,
             sinks=spec.sinks,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:

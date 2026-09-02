@@ -69,9 +69,15 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--kv-cache-dtype` | auto | KV storage dtype: `auto` uses the compute dtype; experimental `fp8_e4m3` uses dynamically scaled E4M3 KV storage |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--attention-backend`, `--attn` | auto | `trtllm`/`fi`/`fa`/`triton`/`dsv4_sparse`/`dsa`; `prefill,decode` pair allowed; auto picks per model + GPU |
+
+The experimental FP8 KV cache currently supports Qwen3.5/Qwen3.6 MoE models with
+BF16 compute, tensor parallel size 1, the Triton attention backend, and NVIDIA GPUs
+with compute capability 8.9 or newer. It computes an independent FP32 scale for
+each token, KV head, and K/V tensor; checkpoint calibration scales are not used.
 
 ### MoE offload
 
@@ -172,4 +178,3 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

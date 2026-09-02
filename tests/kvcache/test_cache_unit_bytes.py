@@ -50,6 +50,24 @@ def test_kv_bytes_per_token_from_mha_buffer():
     assert ub["mamba_bytes_per_slot"] == 0
 
 
+def test_fp8_kv_bytes_include_per_token_head_scales_and_survive_rebuild():
+    layers, kv_heads, head_dim = 4, 2, 64
+    eng = _mha_engine(
+        layers=layers, kv_heads=kv_heads, head_dim=head_dim, dtype=torch.float8_e4m3fn
+    )
+    pool = eng.kv_cache
+    # E4M3 K/V data plus one FP32 scale for each K/V token/head/layer.
+    expected = 2 * layers * kv_heads * head_dim + 2 * layers * kv_heads * 4
+    assert compute_cache_unit_bytes(eng)["kv_bytes_per_token"] == expected
+    assert pool.k_scale(0).dtype == torch.float32
+    assert pool.v_scale(0).shape[-1] == kv_heads
+
+    pool.rebuild(num_pages=7)
+    assert pool.k_cache(0).shape[:2] == (7, 16)
+    assert pool.k_scale(0).shape == (7, 16, kv_heads)
+    assert pool.unit_bytes() == (expected, 0)
+
+
 def test_kv_and_swa_bytes_per_token_from_hybrid_pools():
     # HybridSWAKVCache owns two pools: the full one denominates kv_bytes_per_token (over its
     # own layers), the window one swa_bytes_per_token (token-granular).

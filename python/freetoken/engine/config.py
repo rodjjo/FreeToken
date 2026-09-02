@@ -18,6 +18,9 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # None keeps the paged KV cache in the model compute dtype. The first
+    # quantized-cache implementation supports E4M3 on the Qwen/Triton path.
+    kv_cache_dtype: torch.dtype | None = None
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"
