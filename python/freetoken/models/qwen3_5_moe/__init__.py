@@ -9,6 +9,7 @@ from .model import Qwen3_5MoEForCausalLM
 from .weight import (
     iter_weights,
     iter_weights_parallel,
+    load_mtp_weights,
     load_nvfp4_expert_sources,
     load_nvfp4_expert_sources_parallel,
     setup_offload_expert_banks,
@@ -23,6 +24,7 @@ __all__ = [
     "dummy_gguf_expert_sources",
     "iter_weights",
     "iter_weights_parallel",
+    "load_mtp_weights",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "setup_offload_expert_banks",

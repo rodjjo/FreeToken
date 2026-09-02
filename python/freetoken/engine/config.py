@@ -89,6 +89,16 @@ class EngineConfig:
     # and the sub-byte "q4_0"/"q6_0" pack multiple values per byte. Resolved through
     # freetoken.kvcache.quant.resolve_kv_quant by the pools and the cost model.
     kv_cache_dtype: str = "auto"
+    # MTP / nextn speculative head (--mtp): opt-in, qwen3_5_moe checkpoints that ship a head
+    # (mtp_num_hidden_layers in their config). Enables the head module, loads its weights and
+    # sizes the KV pool for the head's extra full-attention layer. Off by default -- when off,
+    # serving is byte-for-byte what it was before.
+    mtp: bool = False
+    # Draft lookahead (--mtp-draft): how many tokens the head proposes per speculative step.
+    mtp_draft: int = 1
+    # Optional path to the MTP head weights when they live outside the base checkpoint dir
+    # (e.g. shisa-ai's packed model-mtp.safetensors). Defaults to the base --model-path.
+    mtp_model_path: str | None = None
 
     def __post_init__(self):
         super_post = getattr(super(), "__post_init__", None)
@@ -101,7 +111,6 @@ class EngineConfig:
         from freetoken.kvcache.quant import resolve_kv_quant
 
         object.__setattr__(self, "kv_quant", resolve_kv_quant(self.kv_cache_dtype))
-
 
     @cached_property
     def hf_config(self):
