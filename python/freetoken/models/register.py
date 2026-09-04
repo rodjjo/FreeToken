@@ -143,6 +143,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm5_next",
         "Glm5NextForCausalLM",
     ),
+    "K2HorizonForCausalLM": ModelSpec(
+        "freetoken.models.k2_horizon",
+        "K2HorizonForCausalLM",
+    ),
 }
 
 

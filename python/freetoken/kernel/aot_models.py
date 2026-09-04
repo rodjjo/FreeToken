@@ -147,6 +147,15 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
     ),
     AotModel(
+        name="k2-horizon-MoVa-36B-A4B",
+        architecture="K2HorizonForCausalLM",
+        hidden_size=2560,
+        kv_groups=((8, 128),),
+        top_k=8,
+        moe_intermediate_size=768,
+        expert_formats=("bf16",),
+    ),
+    AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
         architecture="Qwen3_5MoeForConditionalGeneration",
         hidden_size=2048,

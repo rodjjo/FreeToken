@@ -362,7 +362,12 @@ def parse_args(
         ),
     )
 
-    kv_capacity_group.add_argument(
+    # NOTE: --kv-cache-dtype is deliberately NOT part of kv_capacity_group. It selects
+    # the per-element storage format and is orthogonal to the capacity knobs -- a launch
+    # may want to preallocate --num-tokens/--num-pages AND pick q4_0/q6_0/... storage
+    # (upstream PR-268 had it inside the mutually-exclusive group, which rejected the
+    # perfectly valid `--num-tokens N --kv-cache-dtype q4_0` combination).
+    parser.add_argument(
         "--kv-cache-dtype",
         type=str,
         choices=list(KV_CACHE_DTYPES),

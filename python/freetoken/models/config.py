@@ -321,6 +321,10 @@ class ModelConfig:
     moe_weight_format: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
+    layernorm_num_groups: int = 1
+    mova_num_experts: int = 0
+    mova_num_experts_per_tok: int = 0
+    attention_gate_func: str | None = None
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.

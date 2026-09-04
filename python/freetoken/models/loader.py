@@ -335,9 +335,10 @@ def _copy_expert_layer_into_bank(
     config,
     dtype: torch.dtype,
 ) -> None:
-    if layer < 0 or layer >= config.num_layers:
+    num_moe_layers = getattr(config, "num_moe_layers", config.num_layers)
+    if layer < 0 or layer >= num_moe_layers:
         raise ValueError(
-            f"Unexpected MoE expert layer {layer}; expected [0, {config.num_layers})"
+            f"Unexpected MoE expert layer {layer}; expected [0, {num_moe_layers})"
         )
     if tensor.size(0) != config.num_experts:
         raise ValueError(
@@ -382,9 +383,11 @@ def stream_moe_expert_sources(
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
+    dense_offset = getattr(config, "first_k_dense_replace", 0)
+    num_moe_layers = getattr(config, "num_moe_layers", config.num_layers - dense_offset)
     banks: dict[str, list] = {  # name -> per-layer [bank obj (HostBank/_PlainBank) or None]
-        "gate_up": [None] * config.num_layers,
-        "down": [None] * config.num_layers,
+        "gate_up": [None] * num_moe_layers,
+        "down": [None] * num_moe_layers,
     }
     row_shape: dict[str, tuple[int, ...]] = {}
     seen_layers: dict[str, set[int]] = {"gate_up": set(), "down": set()}
@@ -397,19 +400,20 @@ def stream_moe_expert_sources(
                 raise ValueError(f"Unexpected expert weight key: {name}")
             layer, packed_name = expert_info
             bank_name = "gate_up" if packed_name == "gate_up_proj" else "down"
+            bank_layer = layer - dense_offset
             _copy_expert_layer_into_bank(
                 banks,
                 row_shape,
                 seen_layers,
                 bank_name=bank_name,
                 tensor=tensor,
-                layer=layer,
+                layer=bank_layer,
                 config=config,
                 dtype=dtype,
             )
-            tracker.note(layer)
+            tracker.note(bank_layer)
 
-        expected_layers = set(range(config.num_layers))
+        expected_layers = set(range(num_moe_layers))
         missing = {
             name: sorted(expected_layers - seen)
             for name, seen in seen_layers.items()

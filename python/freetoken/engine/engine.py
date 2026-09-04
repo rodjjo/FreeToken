@@ -285,24 +285,25 @@ def _make_dummy_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
     for key, param in model_state.items():
+        param_device = param.device if param.device.type == "cpu" else device
         if param.dtype in fp8_dtypes:
             # torch.randn is not implemented for fp8; fill via a uint8 view with small
             # codes (avoid NaN/inf fp8 encodings). Lets dummy-weight startup work for
             # block-fp8 models (the dense fp8 linears are fp8 regardless of moe_backend).
-            t = torch.empty(param.shape, dtype=param.dtype, device=device)
+            t = torch.empty(param.shape, dtype=param.dtype, device=param_device)
             t.view(torch.uint8).random_(0, 16)
             state_dict[key] = t
         elif param.dtype.is_floating_point or param.dtype.is_complex:
-            state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=device)
+            state_dict[key] = torch.randn(param.shape, dtype=param.dtype, device=param_device)
         elif param.dtype == torch.uint8 and key.endswith("weight_scale_inv"):
             # MXFP8 e8m0 exponent codes: 127 encodes scale 1.0; zeros would collapse
             # every scale to 2^-127 and zero the model. Scoped BY NAME: other uint8
             # buffers are packed payloads whose bytes mean something else entirely
             # (GGUF qweight blocks embed fp16 scales -- 0x7F7F is fp16 NaN), so they
             # keep the benign all-zeros fill below.
-            state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=device)
+            state_dict[key] = torch.full(param.shape, 127, dtype=param.dtype, device=param_device)
         else:
-            state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=device)
+            state_dict[key] = torch.zeros(param.shape, dtype=param.dtype, device=param_device)
     return state_dict
 
 
@@ -315,10 +316,18 @@ def _materialize_loaded_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
+        target_device = (
+            expected.device
+            if expected is not None and expected.device.type == "cpu"
+            else device
+        )
         if expected is None:
-            state_dict[key] = weight.to(device=device)
+            state_dict[key] = weight.to(device=target_device)
         else:
-            state_dict[key] = weight.to(device=device, dtype=expected.dtype)
+            t = weight.to(device=target_device, dtype=expected.dtype)
+            if target_device.type == "cpu" and torch.cuda.is_available():
+                t = t.pin_memory()
+            state_dict[key] = t
     return state_dict
 
 
