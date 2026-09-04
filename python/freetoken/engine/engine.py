@@ -1323,7 +1323,7 @@ def _adjust_config(config: EngineConfig):
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
-    if getattr(model_config, "model_type", None) == "k2_horizon" and is_offload_moe_backend(config.moe_backend):
+    if getattr(model_config, "model_type", None) == "k2_horizon":
         # MoVA value experts live on host CPU to fit within 16GB VRAM; host-offloaded weights
         # cannot be captured into CUDA graphs (D2H and H2D transfers are illegal during stream capture).
         override("cuda_graph_max_bs", 0)

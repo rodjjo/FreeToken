@@ -11,6 +11,9 @@ import functools
 import importlib.util
 
 
+import os
+
+
 def _importable(name: str) -> bool:
     # find_spec normally returns None when a package is absent, but it can raise
     # (broken parent package, or a meta_path finder that blocks the name); treat
@@ -23,6 +26,8 @@ def _importable(name: str) -> bool:
 
 @functools.cache
 def is_flashinfer_installed() -> bool:
+    if os.getenv("FREETOKEN_DISABLE_FLASHINFER", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
     return _importable("flashinfer")
 
 
