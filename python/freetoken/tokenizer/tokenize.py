@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import importlib.util
+import io
 import json
 import os
 import threading
+from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, List
+from typing import Any, Dict, List, Tuple
 
 import torch
 from freetoken.message import TokenizeMsg
@@ -46,19 +50,191 @@ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: An
 _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
+@dataclass
+class MultimodalInputs:
+    """One request's image tensors, in the layout the model's ``encode_images`` wants.
+
+    Produced here (tokenizer worker, CPU) and shipped to the scheduler, which owns the
+    model and turns them into soft-token embeddings. Sizes are modest but not tiny --
+    gemma-4 gives ``[1, 2520, 768]`` fp32 per image (~7.7 MB) -- so they ride the normal
+    backend queue rather than being recomputed on the other side.
+    """
+
+    #: The processor's own pixel layout, passed to the model untouched. gemma-4 gives
+    #: ``[num_images, num_patches, 3*patch**2]``; Qwen3-VL packs every image's patches into one
+    #: ``[total_patches, 3*temporal*patch**2]`` and describes the split in ``image_grid_thw``.
+    pixel_values: torch.Tensor
+    #: The geometry the model needs to place those patches, in whichever form its processor
+    #: emits: gemma-4's ``image_position_ids`` ``[num_images, num_patches, 2]``, or Qwen3-VL's
+    #: ``image_grid_thw`` ``[num_images, 3]``. Exactly one is set; the model's
+    #: ``encode_images`` knows which one it asked for.
+    image_position_ids: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+
+
+def _decode_data_url(url: str) -> bytes:
+    """``data:image/png;base64,....`` -> raw bytes. Only data URLs are accepted: fetching
+    a remote URL from inside the tokenizer worker would let a request drive outbound
+    network traffic, so callers must inline the image."""
+    if not url.startswith("data:"):
+        raise ValueError(
+            "image_url must be a data: URL with inline base64 (remote URLs are not fetched)"
+        )
+    _, _, payload = url.partition(",")
+    if ";base64" not in url.split(",", 1)[0]:
+        raise ValueError("image_url data URL must be base64-encoded")
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"image_url base64 payload is not decodable: {exc}") from exc
+
+
+def split_image_parts(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[bytes]]:
+    """Split chat messages into (template-ready messages, image payloads).
+
+    ``{"type": "image_url", "image_url": {"url": "data:..."}}`` blocks become bare
+    ``{"type": "image"}`` placeholders -- what HF chat templates expect -- and their bytes
+    are returned in the order the template will consume them. Messages without images pass
+    through unchanged, so the text-only path keeps its exact behaviour.
+    """
+    images: List[bytes] = []
+    out: List[Dict[str, Any]] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        parts: List[Dict[str, Any]] = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                parts.append(part)
+                continue
+            spec = part.get("image_url") or {}
+            url = spec.get("url") if isinstance(spec, dict) else spec
+            images.append(_decode_data_url(str(url or "")))
+            parts.append({"type": "image"})
+        out.append({**msg, "content": parts})
+    return out, images
+
+
+class ImageInputUnsupported(ValueError):
+    """This deployment cannot accept images at all -- a CLIENT error (400), unlike a
+    processor that exists but fails to load (a server fault, 500). Separated because
+    /v1/messages/count_tokens has no per-request isolation to fall back on: without this
+    distinction an agent client asking to count an image-bearing turn got a 500."""
+
+
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(
+        self, tokenizer: PreTrainedTokenizerBase, processor_path: str | None = None
+    ) -> None:
         self.tokenizer = tokenizer
+        # Only set for checkpoints that ship an image processor AND have vision enabled;
+        # loaded on the first image so text-only serving never pays for it.
+        self._processor_path = processor_path
+        self._processor_obj: Any | None = None
+        self._processor_lock = threading.Lock()
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
+    def _processor(self) -> Any:
+        """The HF processor for this checkpoint, loaded once, on the first image."""
+        with self._processor_lock:
+            if self._processor_obj is None:
+                if self._processor_path is None:
+                    raise ImageInputUnsupported(
+                        "this model does not accept image input: either its family has "
+                        "no vision tower here, or vision is off (pass --vision), or the "
+                        "checkpoint has no processor config"
+                    )
+                try:
+                    from transformers import AutoProcessor
+                except ImportError as exc:  # pragma: no cover - import guard
+                    raise ValueError(f"image input needs transformers: {exc}") from exc
+                try:
+                    self._processor_obj = AutoProcessor.from_pretrained(self._processor_path)
+                except Exception as exc:
+                    # Pillow/torchvision are optional extras; say so instead of surfacing
+                    # transformers' lazy-import message to the API caller.
+                    raise ValueError(
+                        f"could not load the image processor ({exc}); image input needs "
+                        "the 'vision' extra: pip install 'freetoken[vision]'"
+                    ) from exc
+            return self._processor_obj
+
+    def encode_multimodal(
+        self, msg: TokenizeMsg, messages: List[Dict[str, Any]], images: List[bytes]
+    ) -> Tuple[torch.Tensor, MultimodalInputs]:
+        """Render + tokenize a request that carries images, via the HF processor.
+
+        The processor owns both halves and must run together: it expands each
+        ``{"type": "image"}`` placeholder into exactly the number of image tokens its
+        patch grid produced, so tokenizing the text separately would desynchronise the
+        count the model asserts on.
+        """
+        from PIL import Image
+
+        proc = self._processor()
+        # Same effort quantization every other render path applies (render_prompt ->
+        # _sanitize_effort): an unsupported reasoning_effort must not render differently
+        # just because the request happened to carry an image.
+        chat_template_kwargs = dict(self._sanitize_effort(dict(msg.chat_template_kwargs or {})))
+        # ...and the same reasoning_strength broadcast (_render): a template reading only that
+        # spelling would otherwise see no effort at all once the request carried an image.
+        if "reasoning_effort" in chat_template_kwargs:
+            chat_template_kwargs.setdefault(
+                "reasoning_strength", chat_template_kwargs["reasoning_effort"]
+            )
+        if msg.tools is not None:
+            chat_template_kwargs["tools"] = msg.tools
+        prompt = proc.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, **chat_template_kwargs
+        )
+        # The template emits exactly one placeholder per image block; any extra one came from
+        # the request's own TEXT, because the placeholder has a printable spelling
+        # (`<|image_pad|>`). Left alone, the processor runs out of images mid-expansion and
+        # raises StopIteration -- whose str() is empty, so the client got
+        # "could not encode request: " and nothing else. Say what is actually wrong.
+        marker = getattr(proc, "image_token", None)
+        if isinstance(marker, str) and marker:
+            extra = prompt.count(marker) - len(images)
+            if extra > 0:
+                raise ValueError(
+                    f"prompt text contains {extra} literal {marker!r} token(s) beyond its "
+                    f"{len(images)} image(s); remove them (the image placeholder is reserved "
+                    "for the processor's own expansion)"
+                )
+        pil = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
+        enc = proc(text=[prompt], images=pil, return_tensors="pt")
+        return (
+            enc["input_ids"][0].view(-1).to(torch.int32),
+            MultimodalInputs(
+                pixel_values=enc["pixel_values"],
+                # Whichever the checkpoint's processor produced. Neither key is universal:
+                # gemma-4 has no grid_thw, Qwen3-VL has no position_ids.
+                image_position_ids=enc.get("image_position_ids"),
+                image_grid_thw=enc.get("image_grid_thw"),
+            ),
+        )
+
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+        """Text-only encode. Callers that must support images use :meth:`encode`."""
+        return [ids for ids, _ in self.encode(msgs)]
+
+    def encode(self, msgs: List[TokenizeMsg]) -> List[Tuple[torch.Tensor, MultimodalInputs | None]]:
+        results: List[Tuple[torch.Tensor, MultimodalInputs | None]] = []
         # TODO: batch tokenization
         for msg in msgs:
+            if isinstance(msg.text, list):
+                messages, images = split_image_parts(msg.text)
+                if images:
+                    results.append(self.encode_multimodal(msg, messages, images))
+                    continue
             prompt = self.render_prompt(msg)
             # A jinja chat template owns every special token (HF's apply_chat_template
             # tokenizes with add_special_tokens=False for the same reason): tokenizers
@@ -71,7 +247,7 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            results.append((input_ids.view(-1).to(torch.int32), None))
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:

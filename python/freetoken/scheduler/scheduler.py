@@ -88,8 +88,16 @@ class Scheduler(SchedulerIOMixin):
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
         self.decode_manager = DecodeManager(config.page_size)
+        # Lets a chunked prefill split a multimodal prompt anywhere the image tokens are not;
+        # None (text-only build) keeps the conservative "whole prompt in one chunk" rule.
+        mc = config.model_config
+        image_token_id = mc.image_token_id if getattr(mc, "is_multimodal", False) else None
+        self.image_token_id = image_token_id
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            image_token_id=image_token_id,
         )
 
         # some alias for easy access
@@ -520,6 +528,19 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.pixel_values is not None and msg.mm_embeds is None:
+                # Online image path: the tokenizer worker produced the processor tensors;
+                # the vision tower lives here, so run it once at admission and hand the
+                # request its soft tokens. Failing here (vision off, OOM, shape mismatch)
+                # is terminal for THIS request only -- never a worker crash.
+                try:
+                    msg.mm_embeds = self._encode_request_images(msg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_rank0("image encode failed for request %d: %r", msg.uid, exc)
+                    self.send_result(
+                        [ErrorReplyMsg(uid=msg.uid, error=f"could not process image input: {exc}")]
+                    )
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -818,15 +839,59 @@ class Scheduler(SchedulerIOMixin):
             write_tuple=write_mapping,
         )
 
+    def _encode_request_images(self, msg: UserMsg) -> torch.Tensor:
+        """Run the vision tower on one request's processor tensors -> soft-token embeds.
+
+        The scheduler process owns the model, so this is the only place the online path can
+        do it (the tokenizer worker has no GPU model, and the serialized queue cannot carry
+        the resulting device tensor from anywhere else)."""
+        model = self.engine.model
+        encode = getattr(model, "encode_images", None)
+        if encode is None:
+            raise RuntimeError(
+                f"{type(model).__name__} was built without a vision tower -- this model "
+                "family has no vision tower here, or --vision was not passed when it "
+                "was loaded"
+            )
+        device = self.engine.device
+        # Processors disagree on how they describe an image's geometry -- gemma-4 emits
+        # image_position_ids, Qwen3-VL emits image_grid_thw -- and the tokenizer forwards
+        # whichever its own processor produced. Hand over the one that is set; a model whose
+        # encode_images wants the other signature fails loudly here rather than silently
+        # reading zeros.
+        geometry = msg.image_grid_thw if msg.image_grid_thw is not None else msg.image_position_ids
+        if geometry is None:
+            raise RuntimeError(
+                "request carries pixel_values with neither image_grid_thw nor "
+                "image_position_ids; the tokenizer's processor produced no geometry"
+            )
+        embeds = encode(msg.pixel_values.to(device), geometry.to(device))
+        # The model scatters these into every image-token position it sees, so the two counts
+        # must already agree HERE, where a mismatch is still a per-request error the caller
+        # turns into one error reply. Reaching the forward with a mismatch is unrecoverable:
+        # the scatter is inside the batch, so it would take the whole worker down -- and the
+        # image token has a printable spelling (`<|image_pad|>` -> 248056 on Qwen3-VL), so a
+        # request can put extra ones in its own text just by typing them.
+        if self.image_token_id is not None:
+            n_slots = int((msg.input_ids == self.image_token_id).sum())
+            if n_slots != embeds.shape[0]:
+                raise RuntimeError(
+                    f"prompt has {n_slots} image-token placeholders but the vision tower "
+                    f"produced {embeds.shape[0]} embeddings; if the text contains a literal "
+                    f"image placeholder token, remove it"
+                )
+        return embeds
+
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
+        """Flag a prefill batch that carries images, so the model's per-request scatter runs
+        at all (every decode step and every text prefill skips it). ``req.mm_embeds``
         is kept (not cleared) so the cache manager can recognize multimodal requests and
         keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        carry per-image content) -- ``req.mm_scatter`` is what says whether this particular
+        chunk is the one holding the image tokens."""
+        batch.has_images = any(
+            req.mm_embeds is not None and req.mm_scatter for req in batch.reqs
+        )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -834,6 +899,17 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        for uid, reason, prior_chunk in self.prefill_manager.drain_rejections():
+            # Requests the prefill manager found unschedulable no matter how long they wait
+            # (today: a multimodal prompt whose image tokens outrun the largest chunk this
+            # server schedules). Terminal for that request only -- the loop keeps running.
+            if prior_chunk is not None:
+                # Rejected mid-prompt: earlier chunks already forwarded, and dropping the
+                # request from the queue leaves nobody to return their KV pages, table row
+                # and GDN slots. Same release an abort does.
+                self._free_req_resources(prior_chunk)
+            logger.warning_rank0("Dropping request %d: %s", uid, reason)
+            self.send_result([ErrorReplyMsg(uid=uid, error=reason, code="context_length_exceeded")])
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)

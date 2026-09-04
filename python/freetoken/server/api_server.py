@@ -209,7 +209,16 @@ class FrontendManager:
                 from freetoken.tokenizer.tokenize import TokenizeManager
                 from freetoken.utils import load_tokenizer
 
-                self._frontend_tokenizer = TokenizeManager(load_tokenizer(self.config.model_path))
+                # Same processor probe the tokenizer worker runs: /v1/messages/count_tokens
+                # goes through this manager, and an image-bearing conversation reaches
+                # encode_multimodal, which needs the processor. Without it a --vision server
+                # answered 500 on the one endpoint an agent client calls before every turn.
+                from freetoken.tokenizer.server import _image_processor_path
+
+                path = self.config.model_path
+                self._frontend_tokenizer = TokenizeManager(
+                    load_tokenizer(path), processor_path=_image_processor_path(path)
+                )
             return self._frontend_tokenizer
 
     def warm_frontend_tokenizer(self) -> None:
@@ -932,6 +941,14 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
 
     if config.sampling_defaults == "model" and not config.use_dummy_weight:
         _MODEL_SAMPLING = load_generation_sampling(config.model_path)
+    # The tokenizer worker probes the model family to decide whether to accept images; it runs
+    # in this process tree, so the gate has to be set here too (launch.py sets it for the
+    # scheduler process, which is the one that actually builds the tower).
+    from freetoken.models.config import set_vision_enabled
+
+    set_vision_enabled(config.vision)
+    if config.vision:
+        logger.info("Vision enabled: the checkpoint's vision tower will be built and loaded")
     # Always surface the effective default sampling (model-recommended where available,
     # else framework defaults), since unspecified request fields resolve to these.
     logger.info(

@@ -164,6 +164,19 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # Vision is opt-in (--vision / FREETOKEN_LOAD_VISION): the tower is ~0.8 GiB of resident
+    # bf16 that text-only serving never reads. Returning None here is the single switch --
+    # the model build and weight loading both flow through is_multimodal.
+    from freetoken.models.config import vision_load_enabled
+
+    from .vision import parse_vision_config
+
+    vision_cfg = (
+        parse_vision_config(getattr(hf_config, "vision_config", None), text.hidden_size)
+        if vision_load_enabled()
+        else None
+    )
+
     expert_quant, weight_block_size = _fp8_block_quant(hf_config)
     if expert_quant == "none":
         expert_quant = _expert_quant(hf_config)  # nvfp4 / mixed-precision modelopt
@@ -249,7 +262,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen3_5_moe"),
         architectures=getattr(hf_config, "architectures", ["Qwen3_5MoeForConditionalGeneration"]),
-        vision_config=None,  # text-only milestone
+        vision_config=vision_cfg,
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,

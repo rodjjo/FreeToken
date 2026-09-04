@@ -43,6 +43,11 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Whether THIS chunk's forward is the one that scatters them. A chunked multimodal prompt
+    # keeps mm_embeds set on every chunk -- the cache manager reads it as "image placeholders
+    # share a token id, keep this out of the shared prefix cache" -- but only the chunk that
+    # actually contains the image tokens may scatter, or the model's slot-count assert trips.
+    mm_scatter: bool = True
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -133,8 +138,10 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
-    mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    # Whether any request in this prefill batch scatters image features. The features
+    # themselves live on the requests (Req.mm_embeds): the models scatter per request, so a
+    # concatenated batch-wide copy would be allocated on every image prefill and never read.
+    has_images: bool = field(default=False, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the

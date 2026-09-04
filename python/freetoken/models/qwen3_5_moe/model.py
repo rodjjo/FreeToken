@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from freetoken.core import get_global_ctx
+
+from .vision import Qwen3_5VisionModel
 from freetoken.layers import (
     BaseOP,
     GemmaRMSNorm,
@@ -78,9 +80,53 @@ class Qwen3_5Model(BaseOP):
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # None for a text-only build, so _merge_multimodal returns immediately.
+        self._image_token_id = config.image_token_id if config.is_multimodal else None
+
+    def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Overwrite the embeddings at image-token positions with the vision tower's output.
+
+        Scatters PER REQUEST, over that request's own slice of the batch. A batch-wide mask
+        would count every image token in the forward against one concatenated tensor -- and
+        the image token has a printable spelling (``<|image_pad|>`` tokenizes straight to
+        248056 on Qwen3-VL), so any other request in the batch could add to that count just by
+        containing the string. That made one request's text able to break another's prefill,
+        and the mismatch surfaces inside the forward, where there is no per-request recovery.
+
+        ``req.mm_embeds`` is set by the scheduler (which owns the model, so it is the only
+        place that can run the tower); ``req.mm_scatter`` says whether THIS chunk is the one
+        holding the image tokens. Text-only batches -- every decode step, and every prefill
+        without an image -- take the early return.
+        """
+        if self._image_token_id is None:
+            return x
+        batch = get_global_ctx().batch
+        if not getattr(batch, "has_images", False):
+            return x  # nothing in this batch scatters; skip the per-request walk
+        offset = 0
+        for req in batch.reqs:
+            n = req.extend_len
+            embeds = req.mm_embeds if getattr(req, "mm_scatter", True) else None
+            if embeds is not None:
+                span = slice(offset, offset + n)
+                mask = input_ids[span] == self._image_token_id
+                n_slots = int(mask.sum())
+                # A raise, not an assert: `python -O` strips asserts, and what follows a
+                # stripped one here is masked_scatter silently taking the wrong number of
+                # rows -- one request's image landing in another's tokens.
+                if n_slots != embeds.shape[0]:
+                    raise RuntimeError(
+                        f"request {req.uid}: image-token slots ({n_slots}) != vision features "
+                        f"({embeds.shape[0]}); the processor's token expansion and the tower's "
+                        "output disagree"
+                    )
+                x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
+            offset += n
+        return x
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
+        x = self._merge_multimodal(input_ids, x)
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
@@ -107,7 +153,27 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tie_word_embeddings=config.tie_word_embeddings,
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
+        # Built only when parse_config kept a vision_config, i.e. only under --vision: the
+        # tower is ~0.8 GiB of bf16 that a text-only deployment never reads.
+        self.visual = Qwen3_5VisionModel(config.vision_config) if config.is_multimodal else None
         super().__init__()
+
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the vision tower. Returns ``[num_soft_tokens, text_hidden]``.
+
+        ``pixel_values``: ``[total_patches, in_ch * temporal * patch**2]`` -- every image's
+        patches packed into one tensor, which is why the split lives in ``image_grid_thw``
+        ``[num_images, 3]`` (t, h, w in PRE-merge patches). The merger folds each 2x2 block,
+        so the result has ``sum(t*h*w) / 4`` rows.
+        """
+        if self.visual is None:
+            raise RuntimeError(
+                "this model was built without a vision tower -- pass --vision (or set "
+                "FREETOKEN_LOAD_VISION=1) so parse_config keeps the checkpoint's vision_config"
+            )
+        return self.visual.forward(pixel_values, image_grid_thw)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

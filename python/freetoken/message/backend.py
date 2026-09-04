@@ -35,8 +35,15 @@ class UserMsg(BaseBackendMsg):
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # the in-process offline path, which owns the model and can run the vision tower
+    # itself; the serialized online path sends the processor tensors below instead and
+    # lets the scheduler encode them.
     mm_embeds: torch.Tensor | None = None
+    # Online image path: HF-processor outputs for this request's images (CPU tensors).
+    # ``[num_images, num_patches, 3*patch**2]`` and ``[num_images, num_patches, 2]``.
+    pixel_values: torch.Tensor | None = None
+    image_position_ids: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
 
 
 @dataclass

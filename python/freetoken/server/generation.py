@@ -23,7 +23,7 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
-from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.tokenize import ImageInputUnsupported, resolve_thinking_mode
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -198,7 +198,7 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_content_parts(content)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -228,6 +228,26 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
             rendered.append(tc)
         m["tool_calls"] = rendered
     return m
+
+
+def _render_content_parts(parts: list[Any]) -> str | list[Any]:
+    """Collapse a content list for the chat template, keeping images intact.
+
+    Text-only content becomes a plain string, which is what every template expects and
+    what this server has always produced. Content that carries an image stays a list so
+    the tokenizer worker can split the pictures out (``split_image_parts``) and run the
+    HF processor; flattening it here is what used to make images vanish silently.
+    """
+    if not any(isinstance(p, dict) and p.get("type") == "image_url" for p in parts):
+        return _flatten_text_parts(parts)
+    kept: list[Any] = []
+    for part in parts:
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype in ("text", "image_url"):
+            kept.append(part)
+        else:
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    return kept
 
 
 def _flatten_text_parts(parts: list[Any]) -> str:
@@ -303,6 +323,11 @@ async def count_prompt_tokens(
     try:
         input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
     except _TemplateError as exc:
+        raise GenerationError(str(exc)) from exc
+    except ImageInputUnsupported as exc:
+        # The conversation carries an image and this deployment has no vision tower. Input
+        # driven, so a 400 like every other unservable-prompt failure -- not the 500 that a
+        # tokenizer *initialization* fault gets.
         raise GenerationError(str(exc)) from exc
     return int(input_ids.numel())
 
