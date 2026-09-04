@@ -111,17 +111,27 @@ class K2HorizonAttention(BaseOP):
         v_experts = self.v_experts
         device = x.device
 
-        if num_tokens == 1:
-            ids = topk_ids[0]
-            if v_experts.device != device:
-                w = v_experts[ids.cpu()].to(device, non_blocking=True)
-            else:
-                w = v_experts[ids]
-            out = F.silu(F.linear(x, w.view(-1, x.shape[-1]))).view(1, self.mova_top_k, self.kv_attn_dim)
-            v = (out * topk_weights.unsqueeze(-1).to(out.dtype)).sum(dim=1)
-            return v
+        # Fast vectorized path when all v_experts are resident on GPU
+        if v_experts.device == device:
+            w = v_experts[topk_ids]
+            out = torch.einsum("bkhd,bd->bkh", w, x)
+            out = F.silu(out)
+            return (out * topk_weights.unsqueeze(-1).to(out.dtype)).sum(dim=1)
 
-        # Prefill / multi-token path
+        # Host-offloaded v_experts decode path (num_tokens <= 16):
+        if num_tokens <= 16:
+            vs = []
+            for t in range(num_tokens):
+                ids = topk_ids[t].cpu()
+                w = v_experts[ids].to(device, non_blocking=True)
+                out = F.silu(F.linear(x[t : t + 1], w.view(-1, x.shape[-1]))).view(
+                    1, self.mova_top_k, self.kv_attn_dim
+                )
+                v_t = (out * topk_weights[t : t + 1].unsqueeze(-1).to(out.dtype)).sum(dim=1)
+                vs.append(v_t)
+            return torch.cat(vs, dim=0)
+
+        # Prefill / multi-token path for host-offloaded v_experts:
         final_v = torch.zeros((num_tokens, self.kv_attn_dim), dtype=x.dtype, device=device)
         expert_mask = F.one_hot(topk_ids, num_classes=self.mova_num_experts).permute(2, 1, 0)
         expert_hits = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero().flatten()
