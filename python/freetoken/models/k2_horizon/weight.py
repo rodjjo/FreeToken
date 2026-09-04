@@ -7,8 +7,6 @@ import safetensors
 import torch
 from freetoken.distributed import get_tp_info
 from freetoken.models.loader import (
-    MergeRule,
-    iter_merged_tensors,
     iter_stacked_experts,
     iter_weight_files,
     shard_tensor,
@@ -21,11 +19,30 @@ from .config import parse_config
 _MLP_EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.mlp\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 _MOVA_EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.self_attn\.v_experts)\.(?P<idx>\d+)\.weight$")
 
-_MERGE_RULES = {
-    ".q_proj": MergeRule(".qkv_proj", "q", ("q", "k", "v")),
-    ".gate_proj": MergeRule(".gate_up_proj", "gate", ("gate", "up")),
-    ".up_proj": MergeRule(".gate_up_proj", "up", ("gate", "up")),
-}
+def iter_k2_merged_tensors(
+    tensors: Iterable[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    merge_buf: dict[str, dict[str, torch.Tensor]] = {}
+    for name, tensor in tensors:
+        # Only merge gate_proj and up_proj inside mlp (dense, shared, and routed experts)
+        if ".mlp." in name and (
+            name.endswith(".gate_proj.weight") or name.endswith(".up_proj.weight")
+        ):
+            is_gate = name.endswith(".gate_proj.weight")
+            merged_key = name.replace(
+                ".gate_proj.weight", ".gate_up_proj.weight"
+            ).replace(".up_proj.weight", ".gate_up_proj.weight")
+            slot = "gate" if is_gate else "up"
+            slots = merge_buf.setdefault(merged_key, {})
+            slots[slot] = tensor
+            if "gate" in slots and "up" in slots:
+                parts = [slots["gate"], slots["up"]]
+                del merge_buf[merged_key]
+                yield merged_key, torch.cat(parts, dim=0)
+        else:
+            yield name, tensor
+
+    assert not merge_buf, f"k2_horizon: Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
 
 
 def _is_mlp_expert(name: str) -> bool:
@@ -103,12 +120,8 @@ def iter_weights(
                     del raw
                     yield name, tensor
 
-    # Merge gate and up projections for dense MLPs and shared experts
-    merged = iter_merged_tensors(
-        sharded_tensors(),
-        _MERGE_RULES,
-        model_name="k2_horizon",
-    )
+    # Merge gate and up projections for dense MLPs, shared experts, and routed experts
+    merged = iter_k2_merged_tensors(sharded_tensors())
 
     # Stack MoVA V-experts (if non-moe included)
     if include_non_moe:
@@ -164,11 +177,7 @@ def iter_weights_parallel(
             )
             yield name, tensor
 
-    merged = iter_merged_tensors(
-        raw_experts(),
-        _MERGE_RULES,
-        model_name="k2_horizon",
-    )
+    merged = iter_k2_merged_tensors(raw_experts())
     yield from iter_stacked_experts(
         merged,
         num_experts=config.num_experts,
