@@ -946,7 +946,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # scheduler process, which is the one that actually builds the tower).
     from freetoken.models.config import set_vision_enabled
 
-    set_vision_enabled(config.vision)
+    # Pin the gate only when --vision was actually given: pinning it to False on every
+    # bare `ft serve` would silently defeat FREETOKEN_LOAD_VISION=1, which is the gate
+    # the rest of the engine (and upstream) documents.
+    if config.vision:
+        set_vision_enabled(True)
     if config.vision:
         logger.info("Vision enabled: the checkpoint's vision tower will be built and loaded")
     # Always surface the effective default sampling (model-recommended where available,

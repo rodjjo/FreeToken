@@ -55,7 +55,10 @@ def _run_tokenize_worker(detach: bool, vision: bool = False, **kwargs) -> None:
     # same is_multimodal that --vision drives.
     from freetoken.models.config import set_vision_enabled
 
-    set_vision_enabled(vision)
+    # Pin only when asked: pinning False on a bare launch would defeat
+    # FREETOKEN_LOAD_VISION=1, the gate the rest of the engine documents.
+    if vision:
+        set_vision_enabled(True)
 
     from freetoken.tokenizer import tokenize_worker
 
@@ -77,7 +80,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # and this process -- not the API process -- is the one that builds the model.
     from freetoken.models.config import set_vision_enabled
 
-    set_vision_enabled(args.vision)
+    if args.vision:
+        set_vision_enabled(True)
 
     import torch
     from freetoken.scheduler import Scheduler
