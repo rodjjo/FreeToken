@@ -158,9 +158,16 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         self.visual = Qwen3_5VisionModel(config.vision_config) if config.is_multimodal else None
         super().__init__()
 
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
-    ) -> torch.Tensor:
+    def encode_images(self, mm: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Takes the processor bundle and reads the keys this family needs -- the caller
+        does not know which those are, which is the point."""
+        pixel_values = mm["pixel_values"]
+        image_grid_thw = mm.get("image_grid_thw")
+        if image_grid_thw is None:
+            raise RuntimeError(
+                "qwen3_5_moe.encode_images needs 'image_grid_thw' in mm_inputs; the "
+                f"processor produced {sorted(mm)}"
+            )
         """Run the vision tower. Returns ``[num_soft_tokens, text_hidden]``.
 
         ``pixel_values``: ``[total_patches, in_ch * temporal * patch**2]`` -- every image's

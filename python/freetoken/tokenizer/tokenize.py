@@ -71,6 +71,20 @@ class MultimodalInputs:
     image_position_ids: torch.Tensor | None = None
     image_grid_thw: torch.Tensor | None = None
 
+    def as_dict(self) -> dict[str, torch.Tensor]:
+        """The same tensors as an opaque bundle for the trip to the scheduler.
+
+        Keys are the processor's own names, so the model reads what it asked for and the
+        layers in between carry the dict without knowing what is in it. Unset geometry is
+        dropped rather than sent as None: a new modality adds a key here and changes
+        nothing on the way."""
+        d = {"pixel_values": self.pixel_values}
+        if self.image_position_ids is not None:
+            d["image_position_ids"] = self.image_position_ids
+        if self.image_grid_thw is not None:
+            d["image_grid_thw"] = self.image_grid_thw
+        return d
+
 
 def _decode_data_url(url: str) -> bytes:
     """``data:image/png;base64,....`` -> raw bytes. Only data URLs are accepted: fetching

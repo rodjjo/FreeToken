@@ -528,7 +528,7 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            if msg.pixel_values is not None and msg.mm_embeds is None:
+            if msg.mm_inputs is not None and msg.mm_embeds is None:
                 # Online image path: the tokenizer worker produced the processor tensors;
                 # the vision tower lives here, so run it once at admission and hand the
                 # request its soft tokens. Failing here (vision off, OOM, shape mismatch)
@@ -854,18 +854,12 @@ class Scheduler(SchedulerIOMixin):
                 "was loaded"
             )
         device = self.engine.device
-        # Processors disagree on how they describe an image's geometry -- gemma-4 emits
-        # image_position_ids, Qwen3-VL emits image_grid_thw -- and the tokenizer forwards
-        # whichever its own processor produced. Hand over the one that is set; a model whose
-        # encode_images wants the other signature fails loudly here rather than silently
-        # reading zeros.
-        geometry = msg.image_grid_thw if msg.image_grid_thw is not None else msg.image_position_ids
-        if geometry is None:
-            raise RuntimeError(
-                "request carries pixel_values with neither image_grid_thw nor "
-                "image_position_ids; the tokenizer's processor produced no geometry"
-            )
-        embeds = encode(msg.pixel_values.to(device), geometry.to(device))
+        # The bundle goes over untouched: which keys an image's geometry lives under is the
+        # processor's business and the model's, not the scheduler's (gemma-4 emits
+        # image_position_ids, Qwen3-VL image_grid_thw). Keeping the choice out of here is
+        # what lets a new modality arrive as a new key rather than a new field on every
+        # layer between the tokenizer and the model.
+        embeds = encode({k: v.to(device) for k, v in msg.mm_inputs.items()})
         # The model scatters these into every image-token position it sees, so the two counts
         # must already agree HERE, where a mismatch is still a per-request error the caller
         # turns into one error reply. Reaching the forward with a mismatch is unrecoverable:

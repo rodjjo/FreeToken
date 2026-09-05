@@ -131,9 +131,16 @@ class Gemma4ForCausalLM(BaseLLMModel):
             convert_gemma4_to_gguf(self, config)
 
     @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def encode_images(self, mm: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Takes the processor bundle and reads the keys this family needs -- the caller
+        does not know which those are, which is the point."""
+        pixel_values = mm["pixel_values"]
+        image_position_ids = mm.get("image_position_ids")
+        if image_position_ids is None:
+            raise RuntimeError(
+                "gemma4.encode_images needs 'image_position_ids' in mm_inputs; the "
+                f"processor produced {sorted(mm)}"
+            )
         """Run the vision tower + projector. Returns ``[num_valid_soft_tokens, text_hidden]``.
 
         ``pixel_values``: ``[num_images, num_patches, 3*patch**2]``;

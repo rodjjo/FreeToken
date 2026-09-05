@@ -295,13 +295,7 @@ def tokenize_worker(
                             uid=msg.uid,
                             input_ids=t,
                             sampling_params=msg.sampling_params,
-                            pixel_values=mm.pixel_values if mm is not None else None,
-                            image_grid_thw=(
-                                mm.image_grid_thw if mm is not None else None
-                            ),
-                            image_position_ids=(
-                                mm.image_position_ids if mm is not None else None
-                            ),
+                            mm_inputs=mm.as_dict() if mm is not None else None,
                         )
                         for msg, (t, mm) in zip(ok_msgs, ok_tensors, strict=True)
                     ]

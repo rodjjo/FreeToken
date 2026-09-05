@@ -39,11 +39,12 @@ class UserMsg(BaseBackendMsg):
     # itself; the serialized online path sends the processor tensors below instead and
     # lets the scheduler encode them.
     mm_embeds: torch.Tensor | None = None
-    # Online image path: HF-processor outputs for this request's images (CPU tensors).
-    # ``[num_images, num_patches, 3*patch**2]`` and ``[num_images, num_patches, 2]``.
-    pixel_values: torch.Tensor | None = None
-    image_position_ids: torch.Tensor | None = None
-    image_grid_thw: torch.Tensor | None = None
+    # Online image path: whatever this checkpoint's HF processor produced for the request's
+    # images, as CPU tensors, kept as one opaque bundle. The transport does not open it --
+    # only the model that will consume it knows which keys it needs (Qwen3-VL wants
+    # ``image_grid_thw``, gemma4 wants ``image_position_ids``, both want ``pixel_values``),
+    # so a new modality is a key here rather than a field on every layer in between.
+    mm_inputs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass

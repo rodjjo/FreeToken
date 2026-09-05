@@ -106,13 +106,15 @@ def test_user_msg_carries_image_tensors():
         uid=1,
         input_ids=torch.arange(3, dtype=torch.int32),
         sampling_params=SamplingParams(),
-        pixel_values=torch.randn(1, 8, 12),
-        image_position_ids=torch.zeros(1, 8, 2, dtype=torch.int64),
+        mm_inputs={
+            "pixel_values": torch.randn(1, 8, 12),
+            "image_position_ids": torch.zeros(1, 8, 2, dtype=torch.int64),
+        },
     )
     got = deserialize_type({"UserMsg": UserMsg, "SamplingParams": SamplingParams},
                            serialize_type(msg))
-    assert got.pixel_values.shape == (1, 8, 12)
-    assert got.image_position_ids.shape == (1, 8, 2)
+    assert got.mm_inputs["pixel_values"].shape == (1, 8, 12)
+    assert got.mm_inputs["image_position_ids"].shape == (1, 8, 2)
     assert torch.equal(got.input_ids, msg.input_ids)
 
 
