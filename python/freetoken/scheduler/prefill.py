@@ -275,6 +275,13 @@ class PrefillAdder:
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
             mm_scatter=mm_scatter,
+            # Sliced exactly like input_ids above: the cache manager indexes both by
+            # cached_len, so a chunk's key must cover the same span its ids do.
+            cache_ids=(
+                None
+                if pending_req.cache_ids is None
+                else pending_req.cache_ids[: cached_len + chunk_size]
+            ),
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -354,6 +361,7 @@ class PrefillManager:
                 req.sampling_params,
                 mm_embeds=req.mm_embeds,
                 image_token_id=self.image_token_id,
+                cache_ids=req.cache_ids,
             )
         )
 

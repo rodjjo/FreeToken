@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import importlib.util
 import io
 import json
@@ -25,6 +26,61 @@ from .effort import (
 )
 
 logger = init_logger(__name__)
+
+# A Qwen3-VL soft token covers 32x32 pixels (patch 16, merge 2), so an unclamped 4K screenshot
+# costs ~8.2k tokens -- more than one prefill chunk, which is a terminal rejection. The
+# checkpoint's own processor config only downscales above 16.7 Mpx, i.e. effectively never, so
+# the cap is applied here instead: ~1 Mpx, about 1000 tokens for any image. Raise it with
+# FREETOKEN_IMAGE_MAX_PIXELS when a prompt genuinely needs the detail.
+IMAGE_MIN_PIXELS = 4 * 28 * 28
+IMAGE_MAX_PIXELS = int(os.getenv("FREETOKEN_IMAGE_MAX_PIXELS", str(1280 * 28 * 28)))
+
+_IMAGE_KEY_BASE = 1 << 30  # image cache-key ids start above every vocabulary
+
+
+def _image_cache_ids(
+    input_ids: torch.Tensor, image_token_id: int, images: List[bytes]
+) -> torch.Tensor | None:
+    """Prefix-cache key ids for an image prompt: ``input_ids`` with each placeholder run replaced
+    by ids derived from that image's content hash.
+
+    Every image expands to the SAME placeholder token id, so a prefix keyed on the raw ids would
+    match a different image's run and serve its KV. Keying the run on the content instead makes
+    the prompt safe to share, which is what lets an agent turn that carries a screenshot reuse the
+    150k tokens in front of it instead of re-prefilling them.
+
+    The ids are >= 2**30, above any vocabulary, so they can never collide with a real token, and
+    they carry the position within the run so two different-length runs of the same image stay
+    distinct. The model still reads ``input_ids``; this tensor is only ever a cache key.
+
+    Which run belongs to which image is read off the prompt, not off the processor's geometry:
+    runs come out in image order, so a 1:1 count means run i is image i. When the counts disagree
+    -- two images expanded into one adjoining run, a template that emits placeholders of its own --
+    the whole placeholder set keys on one hash over every image in order. That is coarser (a
+    prompt differing only in its LAST image no longer shares the prefix before the first) but it
+    is never wrong, which is the property that matters here.
+    """
+    hits = (input_ids == image_token_id).nonzero().flatten()
+    if hits.numel() == 0 or not images:
+        return None
+    digests = [
+        int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") for raw in images
+    ]
+    # Contiguous runs of placeholder positions, in prompt order.
+    breaks = (hits[1:] - hits[:-1] != 1).nonzero().flatten()
+    starts = [0] + (breaks + 1).tolist()
+    ends = (breaks + 1).tolist() + [hits.numel()]
+    if len(starts) != len(digests):
+        combined = int.from_bytes(
+            hashlib.blake2b(b"".join(digests[i].to_bytes(8, "big") for i in range(len(digests))),
+                            digest_size=8).digest(), "big")
+        starts, ends, digests = [0], [hits.numel()], [combined]
+    ids = input_ids.clone()
+    mask = _IMAGE_KEY_BASE - 1
+    for lo, hi, h in zip(starts, ends, digests, strict=True):
+        run = (torch.arange(hi - lo, dtype=torch.int64) + (h & mask)) & mask
+        ids[hits[lo:hi]] = (run + _IMAGE_KEY_BASE).to(ids.dtype)
+    return ids
 
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
@@ -70,6 +126,10 @@ class MultimodalInputs:
     #: ``encode_images`` knows which one it asked for.
     image_position_ids: torch.Tensor | None = None
     image_grid_thw: torch.Tensor | None = None
+    #: Prefix-cache key ids for this prompt (:func:`_image_cache_ids`), or None when the request
+    #: has no usable placeholder run. Not a model input -- it rides the bundle only because that
+    #: is what already reaches the scheduler; ``tokenizer.server`` lifts it back out.
+    cache_ids: torch.Tensor | None = None
 
     def as_dict(self) -> dict[str, torch.Tensor]:
         """The same tensors as an opaque bundle for the trip to the scheduler.
@@ -83,6 +143,8 @@ class MultimodalInputs:
             d["image_position_ids"] = self.image_position_ids
         if self.image_grid_thw is not None:
             d["image_grid_thw"] = self.image_grid_thw
+        if self.cache_ids is not None:
+            d["cache_ids"] = self.cache_ids
         return d
 
 
@@ -171,7 +233,18 @@ class TokenizeManager:
                 except ImportError as exc:  # pragma: no cover - import guard
                     raise ValueError(f"image input needs transformers: {exc}") from exc
                 try:
-                    self._processor_obj = AutoProcessor.from_pretrained(self._processor_path)
+                    # Clamp the image processor's resize bounds on the way in. The
+                    # checkpoint ships longest_edge=16.7 Mpx, which never fires, so a 4K
+                    # screenshot arrives as ~8.2k soft tokens -- past one prefill chunk, where
+                    # a multimodal prompt is terminal. size= is forwarded to the nested image
+                    # processor by AutoProcessor.
+                    self._processor_obj = AutoProcessor.from_pretrained(
+                        self._processor_path,
+                        size={
+                            "shortest_edge": IMAGE_MIN_PIXELS,
+                            "longest_edge": IMAGE_MAX_PIXELS,
+                        },
+                    )
                 except Exception as exc:
                     # Pillow/torchvision are optional extras; say so instead of surfacing
                     # transformers' lazy-import message to the API caller.
@@ -225,14 +298,26 @@ class TokenizeManager:
                 )
         pil = [Image.open(io.BytesIO(raw)).convert("RGB") for raw in images]
         enc = proc(text=[prompt], images=pil, return_tensors="pt")
+        input_ids = enc["input_ids"][0].view(-1).to(torch.int32)
+        # The cache key is built from the RAW request bytes, not from the tensors above: two
+        # requests that sent the same file must key the same, and the processor's output is the
+        # wrong thing to hash (it is float, resize-dependent, and much larger). Failing to build
+        # one is not an error -- the request simply keeps the old behaviour of not sharing a
+        # prefix, which is what the scheduler does with cache_ids=None.
+        cache_ids = None
+        if isinstance(marker, str) and marker:
+            token_id = self.tokenizer.convert_tokens_to_ids(marker)
+            if isinstance(token_id, int) and token_id >= 0:
+                cache_ids = _image_cache_ids(input_ids, token_id, images)
         return (
-            enc["input_ids"][0].view(-1).to(torch.int32),
+            input_ids,
             MultimodalInputs(
                 pixel_values=enc["pixel_values"],
                 # Whichever the checkpoint's processor produced. Neither key is universal:
                 # gemma-4 has no grid_thw, Qwen3-VL has no position_ids.
                 image_position_ids=enc.get("image_position_ids"),
                 image_grid_thw=enc.get("image_grid_thw"),
+                cache_ids=cache_ids,
             ),
         )
 

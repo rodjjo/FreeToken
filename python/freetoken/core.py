@@ -43,6 +43,10 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # What the prefix cache keys this request on when the raw ids cannot be keyed on safely --
+    # an image prompt, where every image expands to the same placeholder id. Same length as
+    # input_ids; None means key on input_ids, which is every text request.
+    cache_ids: torch.Tensor | None = None
     # Whether THIS chunk's forward is the one that scatters them. A chunked multimodal prompt
     # keeps mm_embeds set on every chunk -- the cache manager reads it as "image placeholders
     # share a token id, keep this out of the shared prefix cache" -- but only the chunk that

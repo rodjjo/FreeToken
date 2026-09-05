@@ -22,6 +22,9 @@ class PendingReq:
     #: Token id the soft embeddings are scattered at, when this request carries images. The
     #: adder needs it to find where in input_ids they sit; None for a text-only request.
     image_token_id: int | None = None
+    #: What the prefix cache keys this request on, when the raw ids are unsafe to key on (an
+    #: image prompt: every image expands to the same placeholder id). None -> key on input_ids.
+    cache_ids: torch.Tensor | None = None
 
     @cached_property
     def mm_span(self) -> tuple[int, int] | None:

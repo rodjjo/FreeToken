@@ -34,6 +34,24 @@ from freetoken.utils import (
 )
 
 
+
+def _backend_msg(msg, input_ids, mm):
+    """One tokenized request as the scheduler's ``UserMsg``.
+
+    ``cache_ids`` travels inside the processor bundle -- that is the one channel the tokenizer
+    worker already has -- but it is not a model input, so it is lifted back out here: the
+    scheduler needs it at admission (prefix matching happens before the vision tower runs) and
+    ``encode_images`` should only ever be handed keys its processor produced."""
+    bundle = mm.as_dict() if mm is not None else None
+    cache_ids = bundle.pop("cache_ids", None) if bundle else None
+    return UserMsg(
+        uid=msg.uid,
+        input_ids=input_ids,
+        sampling_params=msg.sampling_params,
+        mm_inputs=bundle,
+        cache_ids=cache_ids,
+    )
+
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
     if isinstance(msg, BatchTokenizerMsg):
         return msg.data
@@ -291,12 +309,7 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(
-                            uid=msg.uid,
-                            input_ids=t,
-                            sampling_params=msg.sampling_params,
-                            mm_inputs=mm.as_dict() if mm is not None else None,
-                        )
+                        _backend_msg(msg, t, mm)
                         for msg, (t, mm) in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))

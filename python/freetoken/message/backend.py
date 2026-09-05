@@ -45,6 +45,12 @@ class UserMsg(BaseBackendMsg):
     # ``image_grid_thw``, gemma4 wants ``image_position_ids``, both want ``pixel_values``),
     # so a new modality is a key here rather than a field on every layer in between.
     mm_inputs: dict[str, torch.Tensor] | None = None
+    # Prefix-cache key ids for an image prompt: input_ids with each image's placeholder run
+    # replaced by ids derived from that image's content hash (tokenize._image_cache_ids). The
+    # model never sees this; it exists so a prompt carrying an image can share a prefix at all,
+    # which keying on the placeholders themselves would make unsafe. None keeps the old
+    # behaviour of not sharing.
+    cache_ids: torch.Tensor | None = None
 
 
 @dataclass
