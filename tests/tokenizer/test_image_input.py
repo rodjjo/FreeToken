@@ -155,7 +155,6 @@ def _pending(prompt_len: int, *, img_at: slice | None, n_img: int = 0, tok_id: i
         input_ids=ids,
         sampling_params=SamplingParams(),
         mm_embeds=torch.randn(n_img, 16) if n_img else None,
-        image_token_id=tok_id,
     )
 
 
@@ -191,25 +190,6 @@ def test_an_unchunked_multimodal_prompt_is_untouched():
 
 
 # ------------------------------------------------------------------------ the span itself
-def test_span_covers_from_the_first_image_token_to_the_last():
-    """Two images with text between them: the span is one interval spanning BOTH, because
-    mm_embeds is a single concatenated tensor scattered in one forward."""
-    p = _pending(400, img_at=None, n_img=8, tok_id=151655)
-    p.input_ids[50:54] = 151655
-    p.input_ids[300:304] = 151655
-    assert p.mm_span == (50, 304)
-    assert int((p.input_ids == 151655).sum()) == 8  # the text between is not an image token
-
-
-def test_span_is_none_when_the_request_carries_no_images():
-    assert _pending(400, img_at=None, n_img=0, tok_id=151655).mm_span is None
-
-
-def test_span_is_none_when_the_prompt_holds_no_placeholder():
-    """Embeddings but no tokens to scatter into: caller decides (today: all-or-nothing)."""
-    assert _pending(400, img_at=None, n_img=4, tok_id=151655).mm_span is None
-
-
 # ------------------------------------------------------------------ vision-capable gate
 def test_text_only_family_never_gets_an_image_processor(monkeypatch):
     """A multimodal CHECKPOINT served by a text-only family (Ornith / qwen3_5_moe, whose
@@ -503,3 +483,99 @@ def test_a_chunk_with_no_image_tokens_scatters_nothing(monkeypatch):
         SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 2)
     )
     assert out.abs().sum().item() == 0.0
+
+
+# ------------------------------------------------------- prefix-cache keys for image prompts
+def _ck(input_ids, images, tok_id=151655):
+    import torch
+
+    from freetoken.tokenizer.tokenize import _image_cache_ids
+
+    return _image_cache_ids(torch.tensor(input_ids, dtype=torch.int32), tok_id, images)
+
+
+def test_the_same_image_keys_the_same_and_a_different_one_does_not():
+    """The whole point: a prompt carrying an image can share a prefix, and the run it shares on
+    is the image's CONTENT -- otherwise a hit hands one image's KV to another, since every
+    image expands to the same placeholder id."""
+    import torch
+
+    a = _ck([1, 151655, 151655, 2], [b"picture-A"])
+    again = _ck([1, 151655, 151655, 2], [b"picture-A"])
+    b = _ck([1, 151655, 151655, 2], [b"picture-B"])
+    assert torch.equal(a, again)
+    assert not torch.equal(a, b)
+    # only the run moves; the text around it still keys on itself
+    assert a[0] == 1 and a[3] == 2
+    assert b[0] == 1 and b[3] == 2
+
+
+def test_the_key_ids_sit_above_every_vocabulary():
+    """A derived id must never collide with a real token."""
+    from freetoken.tokenizer.tokenize import _IMAGE_KEY_BASE
+
+    ids = _ck([1, 151655, 151655, 2], [b"x"])
+    assert int(ids[1]) >= _IMAGE_KEY_BASE and int(ids[2]) >= _IMAGE_KEY_BASE
+    assert int(ids[1]) != int(ids[2])  # position within the run is carried
+
+
+def test_each_image_keys_on_its_own_run():
+    """Two runs, two images: swapping the SECOND must not change the key of the first."""
+    import torch
+
+    ab = _ck([151655, 9, 151655, 151655], [b"A", b"B"])
+    ac = _ck([151655, 9, 151655, 151655], [b"A", b"C"])
+    assert int(ab[0]) == int(ac[0])          # first image's run is untouched
+    assert ab[2:].tolist() != ac[2:].tolist()  # second image's run changed
+
+
+def test_runs_that_do_not_match_the_image_count_fall_back_to_one_hash():
+    """A template that merges two images into one adjoining run cannot be split per image.
+    Keying the whole placeholder set on one combined hash is coarser -- a prompt differing only
+    in its LAST image no longer shares the prefix in front of the first -- but never wrong."""
+    import torch
+
+    two = _ck([1, 151655, 151655, 2], [b"A", b"B"])   # 1 run, 2 images -> combined
+    other = _ck([1, 151655, 151655, 2], [b"A", b"C"])
+    assert not torch.equal(two, other)
+
+
+def test_no_placeholder_or_no_image_produces_no_key():
+    assert _ck([1, 2, 3], [b"A"]) is None
+    assert _ck([1, 151655, 2], []) is None
+
+
+def test_the_cache_key_is_padded_to_the_ids_it_is_compared_against():
+    """cache_ids is built over the PROMPT; input_ids grows by every sampled token. The cache
+    manager slices both by the same cached_len, so a short key would insert fewer ids than
+    there are pages and leak the rest."""
+    import torch
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.cache import _key_ids
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32),
+        cache_ids=torch.tensor([1, 9, 9], dtype=torch.int32),
+    )
+    assert _key_ids(req).tolist() == [1, 9, 9, 4, 5]
+
+
+def test_a_text_request_keys_on_its_own_ids():
+    import torch
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.cache import _key_ids
+
+    ids = torch.tensor([1, 2, 3], dtype=torch.int32)
+    assert _key_ids(SimpleNamespace(input_ids=ids, cache_ids=None)) is ids
+    assert _key_ids(SimpleNamespace(input_ids=ids)) is ids  # scheduler-test stubs carry no field
+
+
+def test_the_image_pixel_ceiling_is_overridable():
+    """The checkpoint's own processor only downscales above 16.7 Mpx, which never fires; the
+    default here is what keeps a 4K screenshot from costing more than one prefill chunk."""
+    from freetoken.tokenizer import tokenize as tk
+
+    assert tk.IMAGE_MAX_PIXELS == 1280 * 28 * 28
+    assert tk.IMAGE_MIN_PIXELS == 4 * 28 * 28

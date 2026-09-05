@@ -97,7 +97,6 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager,
             self.table_manager,
             self.decode_manager,
-            image_token_id=image_token_id,
         )
 
         # some alias for easy access
