@@ -47,11 +47,6 @@ class Req:
     # an image prompt, where every image expands to the same placeholder id. Same length as
     # input_ids; None means key on input_ids, which is every text request.
     cache_ids: torch.Tensor | None = None
-    # Whether THIS chunk's forward is the one that scatters them. A chunked multimodal prompt
-    # keeps mm_embeds set on every chunk -- the cache manager reads it as "image placeholders
-    # share a token id, keep this out of the shared prefix cache" -- but only the chunk that
-    # actually contains the image tokens may scatter, or the model's slot-count assert trips.
-    mm_scatter: bool = True
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

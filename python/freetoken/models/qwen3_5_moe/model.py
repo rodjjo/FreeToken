@@ -94,9 +94,9 @@ class Qwen3_5Model(BaseOP):
         and the mismatch surfaces inside the forward, where there is no per-request recovery.
 
         ``req.mm_embeds`` is set by the scheduler (which owns the model, so it is the only
-        place that can run the tower); ``req.mm_scatter`` says whether THIS chunk is the one
-        holding the image tokens. Text-only batches -- every decode step, and every prefill
-        without an image -- take the early return.
+        place that can run the tower) and covers the whole prompt; this forward takes the
+        window of it belonging to the placeholders inside its own chunk. Text-only batches --
+        every decode step, and every prefill without an image -- take the early return.
         """
         if self._image_token_id is None:
             return x
@@ -106,21 +106,39 @@ class Qwen3_5Model(BaseOP):
         offset = 0
         for req in batch.reqs:
             n = req.extend_len
-            embeds = req.mm_embeds if getattr(req, "mm_scatter", True) else None
-            if embeds is not None:
+            if req.mm_embeds is not None:
                 span = slice(offset, offset + n)
                 mask = input_ids[span] == self._image_token_id
                 n_slots = int(mask.sum())
-                # A raise, not an assert: `python -O` strips asserts, and what follows a
-                # stripped one here is masked_scatter silently taking the wrong number of
-                # rows -- one request's image landing in another's tokens.
-                if n_slots != embeds.shape[0]:
-                    raise RuntimeError(
-                        f"request {req.uid}: image-token slots ({n_slots}) != vision features "
-                        f"({embeds.shape[0]}); the processor's token expansion and the tower's "
-                        "output disagree"
+                if n_slots:
+                    # ``mm_embeds`` holds one row per image token in the WHOLE prompt, in prompt
+                    # order; this forward covers ``input_ids[cached_len:]``. Rows for placeholders
+                    # an earlier chunk (or a prefix-cache hit) already consumed sit in front, so
+                    # the window starts past them. That is what lets a prompt be chunked BETWEEN
+                    # its images instead of having to hold every image in one chunk -- the whole
+                    # span, first image to last, no longer has to fit ``--max-prefill-length``.
+                    # getattr + the zero test: nothing is cached on a first chunk, which is
+                    # every unchunked prompt, so the scan is skipped there -- and the scheduler
+                    # tests drive this with request stubs that carry neither field.
+                    cached = getattr(req, "cached_len", 0)
+                    ids = getattr(req, "input_ids", None)
+                    before = (
+                        int((ids[:cached] == self._image_token_id).sum())
+                        if cached and ids is not None
+                        else 0
                     )
-                x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
+                    embeds = req.mm_embeds[before : before + n_slots]
+                    # A raise, not an assert: `python -O` strips asserts, and what follows a
+                    # stripped one here is masked_scatter silently taking the wrong number of
+                    # rows -- one request's image landing in another's tokens.
+                    if n_slots != embeds.shape[0]:
+                        raise RuntimeError(
+                            f"request {req.uid}: image-token slots ({n_slots}) != vision features "
+                            f"({embeds.shape[0]}) for this chunk (rows {before}..{before + n_slots} "
+                            f"of {req.mm_embeds.shape[0]}); the processor's token expansion and "
+                            "the tower's output disagree"
+                        )
+                    x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
             offset += n
         return x
 

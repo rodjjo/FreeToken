@@ -124,20 +124,11 @@ class CacheManager:
         # hash): the raw placeholder ids are shared across images, so keyed on those a hit could
         # serve another image's KV. A request that produced no key keeps input_ids and, being a
         # text prompt, is safe to key that way.
+        # A hit landing in the MIDDLE of an image's placeholder run used to be unusable -- the
+        # whole run had to reach one forward -- and was capped back to the start of the span.
+        # The model now windows mm_embeds per chunk, so the cached half is simply skipped and
+        # the rest scatters: no cap, and a prompt that ends with its image keeps its prefix.
         ids = _key_ids(req)[: input_len - 1]
-        span = getattr(req, "mm_span", None)
-        if span is not None:
-            # A hit that ENDS INSIDE the image span is unusable: the model scatters mm_embeds
-            # against the image tokens of one forward, so the run has to sit entirely on one side
-            # of the boundary. It happens on every prompt that ends with its image, because the
-            # key above always leaves the last token out. Cap the key at the span start -- the
-            # text in front of the image is still reused, which is the whole prefix in the case
-            # this exists for (an agent turn whose screenshot arrives 150k tokens in).
-            # Without this the adder finds a cut span it cannot move and declines forever:
-            # nothing about the next pass changes the cache, so the request never runs.
-            lo, hi = span
-            if lo < self.prefix_cache.match_prefix(ids).cached_len < hi:
-                ids = ids[:lo]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)

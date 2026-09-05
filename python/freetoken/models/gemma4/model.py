@@ -74,9 +74,10 @@ class Gemma4Model(BaseOP):
         that count just by containing the string. The mismatch surfaces inside the forward,
         which has no per-request recovery, so one request's text would take the worker down.
 
-        ``req.mm_embeds`` is set by the scheduler from that request's vision features;
-        ``req.mm_scatter`` says whether THIS chunk is the one holding the image tokens.
-        Decode batches never carry images and take the early return.
+        ``req.mm_embeds`` is set by the scheduler from that request's vision features and
+        covers the whole prompt; this forward takes the window of it belonging to the
+        placeholders inside its own chunk. Decode batches never carry images and take the
+        early return.
         """
         batch = get_global_ctx().batch
         if not getattr(batch, "has_images", False) or self._image_token_id is None:
@@ -84,19 +85,33 @@ class Gemma4Model(BaseOP):
         offset = 0
         for req in batch.reqs:
             n = req.extend_len
-            embeds = req.mm_embeds if getattr(req, "mm_scatter", True) else None
-            if embeds is not None:
+            if req.mm_embeds is not None:
                 span = slice(offset, offset + n)
                 mask = input_ids[span] == self._image_token_id
                 n_slots = int(mask.sum())
-                # A raise, not an assert: `python -O` strips asserts, and what follows a
-                # stripped one is masked_scatter quietly taking the wrong number of rows.
-                if n_slots != embeds.shape[0]:
-                    raise RuntimeError(
-                        f"request {req.uid}: image-token slots ({n_slots}) != vision features "
-                        f"({embeds.shape[0]}); image tokens must not be split across chunks"
+                if n_slots:
+                    # Rows for placeholders an earlier chunk (or a prefix-cache hit) already
+                    # consumed sit in front of this window; see qwen3_5_moe._merge_multimodal.
+                    # getattr + the zero test: nothing is cached on a first chunk, which is
+                    # every unchunked prompt, so the scan is skipped there -- and the scheduler
+                    # tests drive this with request stubs that carry neither field.
+                    cached = getattr(req, "cached_len", 0)
+                    ids = getattr(req, "input_ids", None)
+                    before = (
+                        int((ids[:cached] == self._image_token_id).sum())
+                        if cached and ids is not None
+                        else 0
                     )
-                x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
+                    embeds = req.mm_embeds[before : before + n_slots]
+                    # A raise, not an assert: `python -O` strips asserts, and what follows a
+                    # stripped one is masked_scatter quietly taking the wrong number of rows.
+                    if n_slots != embeds.shape[0]:
+                        raise RuntimeError(
+                            f"request {req.uid}: image-token slots ({n_slots}) != vision features "
+                            f"({embeds.shape[0]}) for this chunk (rows {before}..{before + n_slots} "
+                            f"of {req.mm_embeds.shape[0]})"
+                        )
+                    x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
             offset += n
         return x
 

@@ -129,6 +129,8 @@ class _NoSwa:  # non-sliding-window cache: chunking is capped by token_budget al
     def __init__(self):
         self.swa_paged = False
         self.prefill_chunk_align = 1  # no snapshot-boundary alignment to respect
+        # _kv_reservation_size charges the adder in whole pages; 1 makes that the token count.
+        self.page_size = 1
 
 
 class _Tables:  # the token_pool row _add_one_req stages the chunk's ids into
@@ -176,125 +178,16 @@ def test_a_long_prompt_with_a_small_image_chunks_instead_of_being_rejected():
     )
     assert got is not None, "must be admitted, not rejected"
     assert got.extend_len == 8192, "chunked at the token budget like a text prompt"
-    assert got.mm_scatter is True
     assert got.mm_embeds is not None
 
 
-def test_only_the_chunk_holding_the_image_tokens_scatters():
-    """Every chunk keeps mm_embeds -- the cache manager reads it as 'keep this out of the
-    shared prefix cache' -- but a chunk with no image tokens must not scatter, or the
-    model's slot-count assert trips on 0 slots vs 196 features."""
-    pending = _pending(9383, img_at=slice(8500, 8696), n_img=196, tok_id=151655)
-    first = _adder(8192, 9383)._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert first is not None and first.mm_scatter is False
-    assert first.mm_embeds is not None, "the multimodal marker survives on every chunk"
-
-    second = _adder(8192, 9383)._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8192
-    )
-    assert second is not None and second.mm_scatter is True
-
-
-def test_the_final_chunk_does_not_scatter_an_earlier_chunks_image():
-    """The last chunk of a chunked prompt has chunk_size == remain_len, so a guard keyed on
-    "is this chunk chunked?" skips it and the default scatter fires into 0 image-token slots.
-    That is the assert that took the scheduler worker down on a live 6k-token prompt."""
-    pending = _pending(9383, img_at=slice(100, 296), n_img=196, tok_id=151655)
-    first = _adder(8192, 9383)._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert first is not None and first.mm_scatter is True
-    last = _adder(8192, 9383)._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8192
-    )
-    assert last is not None
-    assert last.extend_len == 1191 == 9383 - 8192, "this chunk runs to the end of the prompt"
-    assert last.mm_scatter is False, "the image was scattered by chunk one"
-
-
-def test_a_boundary_inside_the_span_pulls_back_instead_of_rejecting():
-    """The 8192 boundary lands inside [8100, 8296), so the chunk ends at 8100 and the span
-    rides chunk two whole. Rejecting here would 400 a perfectly servable request ~0.4% of
-    the time (span width / chunk width) purely on where the image happened to land."""
-    pending = _pending(9383, img_at=slice(8100, 8296), n_img=196, tok_id=151655)
-    adder = _adder(8192, 9383)
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is not None, adder.rejected
-    assert got.extend_len == 8100, "pulled back to just before the first image token"
-    assert got.mm_scatter is False
-    assert adder.rejected == []
-
-    second = _adder(8192, 9383)._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8100
-    )
-    assert second is not None and second.mm_scatter is True
-
-
-def test_a_span_wider_than_one_chunk_is_rejected_not_fatal():
-    """Nothing to pull back to: the image tokens alone outrun the chunk. Terminal for the
-    REQUEST -- return None so the caller's release path runs, because raising from the
-    chunker took the whole scheduler worker down."""
-    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
-    adder = _adder(8192, 20000)  # span 10000 > 8192, the largest chunk this server schedules
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is None
-    assert [uid for uid, _, _ in adder.rejected] == [9]
-    reason = adder.rejected[0][1]
-    assert "[100, 10100)" in reason and "cannot be split" in reason and "10000" in reason
-
-
-def test_the_pull_back_respects_the_chunk_alignment():
-    """A model with snapshot boundaries (prefill_chunk_align) needs the pulled-back end
-    aligned too, or the continuation resumes its carry mid-unit."""
-    pending = _pending(9383, img_at=slice(8100, 8296), n_img=196, tok_id=151655)
-    adder = _adder(8192, 9383)
-    adder.cache_manager.prefill_chunk_align = 256
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is not None and got.extend_len == 7936 == 31 * 256, got.extend_len
-    assert got.mm_scatter is False
-
-
-def test_an_unlocatable_image_span_keeps_the_all_or_nothing_rule():
-    """No image_token_id (text-only build) or a prompt whose placeholder expansion never
-    happened: refuse to guess, and require the whole prompt in one chunk as before.
-
-    The bound is not just --max-prefill-length: on a sliding-window model the swa pool caps
-    the chunk too, which is how a 33k-token agent prompt still chunked at 40960.
-    """
-    from freetoken.scheduler.prefill import PrefillManager
-
-    pending = _pending(9383, img_at=None, n_img=266, tok_id=None)
-    assert pending.mm_span is None
-    adder = _adder(8192, 9383)
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is None, "must return None so the caller releases the pass's resources"
-    assert [uid for uid, _, _ in adder.rejected] == [9]
-    reason = adder.rejected[0][1]
-    assert "9383" in reason and "8192" in reason and "one prefill chunk" in reason
-
-    mgr = PrefillManager(cache_manager=None, table_manager=None, decode_manager=None)
-    mgr.rejections.extend(adder.rejected)
-    assert mgr.drain_rejections() == [(9, reason, None)]
-    assert mgr.drain_rejections() == [], "draining is one-shot"
-
-
 def test_an_unchunked_multimodal_prompt_is_untouched():
-    """The common case -- prompt fits one chunk -- must not go near the span logic."""
+    """The common case -- prompt fits one chunk -- is one forward with every row."""
     pending = _pending(500, img_at=slice(10, 206), n_img=196, tok_id=151655)
     got = _adder(8192, 500)._add_one_req(
         pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
     )
-    assert got is not None and got.mm_scatter is True and got.extend_len == 500
+    assert got is not None and got.extend_len == 500
 
 
 # ------------------------------------------------------------------------ the span itself
@@ -348,50 +241,6 @@ def test_probe_failure_disables_images_rather_than_blocking_startup(monkeypatch)
 
 
 # ------------------------------------------------- budget: transient vs terminal
-def test_losing_this_passs_budget_race_declines_instead_of_rejecting():
-    """token_budget is the pass's REMAINDER -- earlier admissions in the same pass spend it.
-    A prompt whose span would fit a full chunk must not be killed for being second in line:
-    decline (None, stays queued) and let it retry at the front of the queue."""
-    pending = _pending(9383, img_at=slice(100, 5000), n_img=4900, tok_id=151655)
-    adder = _adder(8192, 9383)
-    adder.token_budget = 3000  # what an earlier admission this pass left behind
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is None
-    assert adder.rejected == [], "the span fits 8192; nothing about it is terminal"
-
-
-def test_a_span_over_the_full_budget_is_still_terminal():
-    """The other half: no pass can ever hold this one, so waiting is pointless."""
-    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
-    adder = _adder(8192, 20000)
-    assert adder.max_chunk_budget == 8192
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
-    )
-    assert got is None
-    assert [uid for uid, _, _ in adder.rejected] == [9]
-    assert "largest chunk this server will schedule is 8192" in adder.rejected[0][1]
-
-
-def test_rejecting_a_continuation_hands_back_the_prior_chunk():
-    """Earlier chunks already forwarded: dropping the request from the queue leaves nobody to
-    return their KV pages, table row and GDN slots, so the rejection must carry the Req that
-    owns them. A first-chunk rejection has nothing to hand back (the adder released it)."""
-    pending = _pending(20000, img_at=slice(9000, 19000), n_img=10000, tok_id=151655)
-    adder = _adder(8192, 20000)
-    prior = object()
-    got = adder._add_one_req(
-        pending_req=pending, cache_handle=None, table_idx=0, cached_len=8192,
-        chunked_req=prior,
-    )
-    assert got is None
-    uid, _, handed_back = adder.rejected[0]
-    assert uid == 9 and handed_back is prior
-
-
-# --------------------------------------------- the batch-wide image-token count
 def test_a_stray_placeholder_in_another_request_cannot_break_this_one(monkeypatch):
     """`<|image_pad|>` has a printable spelling and tokenizes straight to the image id, so a
     plain text request can carry it. Under a batch-wide mask its tokens counted against the
@@ -426,34 +275,18 @@ def test_a_count_mismatch_raises_rather_than_asserts(monkeypatch):
     import freetoken.models.qwen3_5_moe.model as mod
 
     IMG = 151655
-    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.zeros(2, 4), mm_scatter=True)
+    # Two placeholders in this forward, one row to scatter: the window comes up short. The
+    # opposite case (more rows than the WHOLE prompt has placeholders) is refused at admission,
+    # in Scheduler._encode_images, where it is still a per-request error reply.
+    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.zeros(1, 4))
     batch = SimpleNamespace(reqs=[req], has_images=True)
     monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
     with pytest.raises(RuntimeError, match="image-token slots"):
         mod.Qwen3_5Model._merge_multimodal(
-            SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, 5, 5]), torch.zeros(3, 4)
+            SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, IMG, 5]), torch.zeros(3, 4)
         )
 
 
-def test_a_chunk_that_does_not_scatter_is_skipped_entirely(monkeypatch):
-    """mm_embeds stays set on every chunk (the cache manager reads it as 'keep this out of the
-    shared prefix cache'), so mm_scatter is what must gate the scatter."""
-    import torch
-    from types import SimpleNamespace
-
-    import freetoken.models.qwen3_5_moe.model as mod
-
-    IMG = 151655
-    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.ones(2, 4), mm_scatter=False)
-    batch = SimpleNamespace(reqs=[req], has_images=True)
-    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
-    out = mod.Qwen3_5Model._merge_multimodal(
-        SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 4)
-    )
-    assert out.abs().sum() == 0
-
-
-# ------------------------------------------------------- the other render paths
 def test_the_image_path_quantizes_reasoning_effort_like_every_other_path():
     """render_prompt sanitizes reasoning_effort; encode_multimodal must too, or an
     unsupported value renders differently depending on whether the request had an image."""
@@ -609,3 +442,64 @@ def test_a_text_only_batch_never_walks_the_requests(monkeypatch):
     assert mod.Qwen3_5Model._merge_multimodal(
         SimpleNamespace(_image_token_id=5), torch.tensor([1, 2, 3]), x
     ) is x
+
+
+def test_a_span_wider_than_one_chunk_now_chunks_instead_of_being_rejected():
+    """The rule this replaced: every image token of the prompt in ONE chunk. A conversation
+    reaches that limit by TALKING between screenshots -- the span runs first image to last, so
+    it grows with the text in between -- and the request was then terminal. It now chunks."""
+    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is not None
+    assert adder.rejected == []
+    assert got.extend_len == 8192  # a plain chunk, boundary inside the span
+
+
+def test_each_chunk_scatters_only_its_own_rows(monkeypatch):
+    """The window: rows for placeholders an earlier chunk consumed sit in front of it."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    # Prompt is [IMG, IMG, 5, IMG]; this forward is the tail, so one placeholder is already done.
+    embeds = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+    req = SimpleNamespace(
+        uid=1, extend_len=3, mm_embeds=embeds, cached_len=1,
+        input_ids=torch.tensor([IMG, IMG, 5, IMG]),
+    )
+    batch = SimpleNamespace(reqs=[req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    x = torch.zeros(3, 2)
+    out = mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, 5, IMG]), x
+    )
+    # rows 1 and 2 -- not 0, which the previous chunk scattered
+    assert out[0].tolist() == [2.0, 2.0]
+    assert out[1].tolist() == [0.0, 0.0]
+    assert out[2].tolist() == [3.0, 3.0]
+
+
+def test_a_chunk_with_no_image_tokens_scatters_nothing(monkeypatch):
+    """Every chunk of an image prompt is flagged now, so the one that happens to carry no
+    placeholder has to be a no-op rather than scattering the next chunk's rows."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    req = SimpleNamespace(
+        uid=1, extend_len=3, mm_embeds=torch.ones(2, 2), cached_len=0,
+        input_ids=torch.tensor([5, 5, 5, IMG, IMG]),
+    )
+    batch = SimpleNamespace(reqs=[req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    out = mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 2)
+    )
+    assert out.abs().sum().item() == 0.0

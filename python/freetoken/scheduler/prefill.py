@@ -152,7 +152,6 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
-        span = pending_req.mm_span if pending_req.mm_embeds is not None else None
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -192,72 +191,14 @@ class PrefillAdder:
             # the request until it gets a bigger turn.
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
-        # A chunk boundary must not cut the IMAGE-TOKEN span: the model scatters the whole of
-        # mm_embeds into the image tokens one forward sees, and asserts the counts match. That
-        # is the ONLY constraint -- the rest of the prompt chunks freely, which is what stops a
-        # 200-token sprite forcing its 166k-token agent turn into a single prefill.
-        #
-        # Runs after all the sizing above (token budget, swa pool, chunk alignment), because any
-        # of them can be what puts the boundary inside the span. Pulling the end back to just
-        # before the span leaves reserved_swa describing a slightly larger chunk than we take --
-        # the same over-reservation the alignment step above already makes, and conservative.
         is_chunked = chunk_size < remain_len
-        mm_scatter = True
-        # Gated on this forward not covering the WHOLE prompt, not on `is_chunked`: the LAST
-        # chunk of a chunked prompt has chunk_size == remain_len, so is_chunked is False there
-        # and the default mm_scatter=True would scatter 196 features into 0 image-token slots.
-        covers_whole_prompt = cached_len == 0 and not is_chunked
-        if not covers_whole_prompt and pending_req.mm_embeds is not None:
-            if span is None:
-                # Images the adder cannot locate -- no image_token_id (text-only build), or a
-                # prompt whose placeholder expansion never happened. Refuse to guess and keep
-                # the old all-or-nothing rule: the whole prompt in one chunk, or nothing.
-                lo, hi = 0, pending_req.input_len
-            else:
-                lo, hi = span
-            end = cached_len + chunk_size
-            if lo < end < hi and lo > cached_len and hi - lo <= chunk_size:
-                # End just before the span instead, so it rides the NEXT chunk whole. Gated on
-                # the span FITTING a chunk this size: pulling back for a span that can never
-                # fit would spend a chunk of prefill and then reject on the following pass,
-                # reporting the same terminal error one pass later than it is known.
-                # Keep both alignments the sizing above established (page-aligned swa
-                # boundary, snapshot boundary); 0 after that means no whole unit fits -> fall
-                # through to the rejection, which is also what a retry would decide.
-                unit = max(self.cache_manager.prefill_chunk_align, 1)
-                if self.cache_manager.swa_paged:
-                    unit = max(unit, self.cache_manager.page_size)
-                pulled = align_down(lo, unit) - cached_len
-                if pulled > 0:
-                    chunk_size = pulled
-                    end = cached_len + chunk_size
-            if lo < end < hi or lo < cached_len < hi:
-                # The span is cut and could not be moved. Terminal ONLY if no pass could ever
-                # hold it: token_budget is this pass's REMAINDER, so a prompt that merely lost
-                # the budget race would be killed for being second in line. Compare against the
-                # pass's full budget instead and, below that, decline transiently (return None)
-                # so the request retries once it reaches the front of the queue.
-                if hi - lo <= self.max_chunk_budget:
-                    return None
-                self.rejected.append(
-                    (
-                        pending_req.uid,
-                        (
-                            f"prompt with images needs {hi - lo} contiguous tokens in one "
-                            f"prefill chunk (the image tokens span [{lo}, {hi}) and cannot "
-                            f"be split) but the largest chunk this server will schedule is "
-                            f"{self.max_chunk_budget}; raise --max-prefill-length, and for a "
-                            f"sliding-window model the window pool caps it further "
-                            f"(--swa-num-pages-override / --kv-reserve-tokens)"
-                        ),
-                        chunked_req,
-                    )
-                )
-                return None
-            # Only the chunk holding the span scatters. The others keep mm_embeds set -- the
-            # cache manager reads it as "image placeholders share a token id, keep this out of
-            # the shared prefix cache" -- but scattering there would find zero image tokens.
-            mm_scatter = cached_len <= lo and hi <= end
+        # An image prompt chunks like text. The model windows mm_embeds to the placeholders
+        # inside each forward (qwen3_5_moe._merge_multimodal), so a boundary may fall between
+        # two images, or between an image and the text around it, without the scatter losing
+        # track of which rows are still owed. What used to be enforced here -- every image
+        # token of the prompt in ONE chunk -- rejected an agent turn as soon as the distance
+        # from its first screenshot to its last outgrew --max-prefill-length, which a long
+        # conversation reaches by talking, not by sending bigger pictures.
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -274,7 +215,6 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
-            mm_scatter=mm_scatter,
             # Sliced exactly like input_ids above: the cache manager indexes both by
             # cached_len, so a chunk's key must cover the same span its ids do.
             cache_ids=(

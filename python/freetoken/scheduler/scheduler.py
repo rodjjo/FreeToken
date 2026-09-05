@@ -878,14 +878,13 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Flag a prefill batch that carries images, so the model's per-request scatter runs
-        at all (every decode step and every text prefill skips it). ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content) -- ``req.mm_scatter`` is what says whether this particular
-        chunk is the one holding the image tokens."""
-        batch.has_images = any(
-            req.mm_embeds is not None and req.mm_scatter for req in batch.reqs
-        )
+        at all (every decode step and every text prefill skips it).
+
+        Every chunk of an image prompt is flagged, not just the one holding the images: the
+        model windows ``mm_embeds`` to the placeholders inside its own forward and scatters
+        nothing when there are none, so the chunk that happens to carry no image costs one
+        mask and a zero count."""
+        batch.has_images = any(req.mm_embeds is not None for req in batch.reqs)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
