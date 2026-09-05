@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import pathlib
 import re
 import shutil
 import signal
@@ -436,6 +437,42 @@ async def _handle_cache_command(
     return pools
 
 
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+_IMAGE_MAX_BYTES = 16 * 1024 * 1024  # the server's own cap on an inline data: URL
+
+
+def _image_data_url(path: str) -> str:
+    """Read a local image file into the data: URL the OpenAI image_url part wants.
+
+    The server accepts inline data: URLs only -- it will not fetch a remote URL on the
+    client's behalf -- so the shell has to do the reading and the encoding here.
+    """
+    import base64
+    import mimetypes
+
+    f = pathlib.Path(path).expanduser()
+    if not f.is_file():
+        raise ValueError(f"no such image: {f}")
+    if f.suffix.lower() not in _IMAGE_SUFFIXES:
+        raise ValueError(f"not an image extension: {f.suffix or '(none)'}")
+    raw = f.read_bytes()
+    if len(raw) > _IMAGE_MAX_BYTES:
+        raise ValueError(f"image is {len(raw) / 2**20:.1f} MiB; the cap is 16 MiB")
+    mime = mimetypes.guess_type(f.name)[0] or "image/png"
+    return f"data:{mime};base64," + base64.b64encode(raw).decode()
+
+
+def _user_content(text: str, images: List[str]):
+    """One user message: a plain string when there are no images, otherwise the
+    OpenAI content-parts list with each image ahead of the text."""
+    if not images:
+        return text
+    parts = [{"type": "image_url", "image_url": {"url": u}} for u in images]
+    if text:
+        parts.append({"type": "text", "text": text})
+    return parts
+
+
 def _help_text(think_gears: Tuple[str, ...], pools: CachePools) -> str:
     """``/help``, written against the served model: the thinking gears come from the server (a
     model with no controllable thinking says so rather than offering a command that no-ops), and
@@ -456,6 +493,7 @@ def _help_text(think_gears: Tuple[str, ...], pools: CachePools) -> str:
         (f"/cache [status | {_cache_targets_hint(pools)}]", ""),
         ("", "show or resize the cache pools; token targets are"),
         ("", "rounded up to the pool's page size"),
+        ("/img <path> [text]", "attach a local image to this turn"),
         ("/reset", "clear the conversation history"),
         ("/exit", "quit (Ctrl-D also works)"),
     ]
@@ -606,13 +644,13 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
             stats.set_prompt_tokens(max(0, _prompt_tokens_total(doc) - prompt_baseline))
             status_line.force()
 
-    async def run_turn(cmd: str) -> None:
+    async def run_turn(cmd: str, images: List[str] | None = None) -> None:
         nonlocal history
         messages: List[dict] = []
         for user_msg, assistant_msg in history:
             messages.append({"role": "user", "content": user_msg})
             messages.append({"role": "assistant", "content": assistant_msg})
-        messages.append({"role": "user", "content": cmd})
+        messages.append({"role": "user", "content": _user_content(cmd, images or [])})
 
         try:
             prompt_baseline = _prompt_tokens_total(await client.stats())
@@ -682,6 +720,23 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
         nonlocal history, think_gear, cache_pools
         if cmd == "":
             return
+        pending_images: List[str] = []
+        if cmd.startswith("/img"):
+            # Not a command that returns: pull the paths off the front, then run the rest
+            # of the line as the turn's prompt.
+            rest = cmd
+            while rest.startswith("/img"):
+                parts = rest.split(None, 2)
+                if len(parts) < 2:
+                    renderer.write("usage: /img <path> [text]\n")
+                    return
+                try:
+                    pending_images.append(_image_data_url(parts[1]))
+                except ValueError as e:
+                    renderer.write(f"{e}\n")
+                    return
+                rest = parts[2] if len(parts) > 2 else ""
+            cmd = rest.strip()
         if cmd.startswith("/"):
             parts = cmd.split()
             slash = parts[0]
@@ -708,7 +763,7 @@ async def _run_shell(client: ShellClient, origin: str, *, connect_grace: float) 
             renderer.write(f"Unknown command: {cmd}. Try /help.\n")
             return
 
-        turn_task = asyncio.create_task(run_turn(cmd))
+        turn_task = asyncio.create_task(run_turn(cmd, pending_images))
         with _sigint_cancels(turn_task), contextlib.suppress(asyncio.CancelledError):
             # run_turn reports the cancellation and closes its stream itself; suppressing here
             # only covers the case where it re-raises after cleanup.
