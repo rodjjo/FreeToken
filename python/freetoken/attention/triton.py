@@ -151,15 +151,50 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
-        kv_heads, head_dim = k_raw.shape[-2], k_raw.shape[-1]
-        assert head_dim == q.shape[-1]
-        k_cache = k_raw.view(-1, kv_heads, head_dim)
-        v_cache = v_raw.view(-1, kv_heads, head_dim)
-        # An fp8 KV pool hands us its per-(token, head) scales; a 16-bit pool returns
-        # None and every kernel below keeps its original (scale-free) code path.
-        k_scale = self.kvcache.k_scale(layer_id)
-        v_scale = self.kvcache.v_scale(layer_id)
-        assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
+        kv_heads = k_raw.shape[-2]
+        logical_head_dim = q.shape[-1]
+        is_fp8 = getattr(self.kvcache, "is_fp8", False)
+        quant = getattr(self.kvcache, "quant", None)
+        quant_enabled = bool(getattr(quant, "enabled", False))
+
+        if is_fp8:
+            head_dim = k_raw.shape[-1]
+            assert head_dim == logical_head_dim
+            k_cache = k_raw.view(-1, kv_heads, head_dim)
+            v_cache = v_raw.view(-1, kv_heads, head_dim)
+            k_scale = self.kvcache.k_scale(layer_id)
+            v_scale = self.kvcache.v_scale(layer_id)
+            assert (k_scale is None) == (v_scale is None), "K and V scales come as a pair"
+            layout = "fp8"
+        elif quant_enabled:
+            physical_head_dim = k_raw.shape[-1]
+            expected_physical = quant.physical_head_dim(logical_head_dim)
+            assert physical_head_dim == expected_physical, (
+                f"KV cache physical head_dim {physical_head_dim} does not match logical "
+                f"head_dim {logical_head_dim} for "
+                f"{getattr(quant, 'name', 'unquantized')} storage"
+            )
+            assert v_raw.shape[-2:] == (kv_heads, physical_head_dim)
+            k_cache = k_raw.view(-1, kv_heads, physical_head_dim)
+            v_cache = v_raw.view(-1, kv_heads, physical_head_dim)
+            k_scale = self.kvcache.k_scale(layer_id)
+            v_scale = self.kvcache.v_scale(layer_id)
+            if k_scale is not None and v_scale is not None:
+                scale_blocks = logical_head_dim // k_scale.shape[-1]
+                assert scale_blocks * k_scale.shape[-1] == logical_head_dim
+                assert v_scale.shape[-1] == k_scale.shape[-1]
+                k_scale = k_scale.view(-1, kv_heads, k_scale.shape[-1])
+                v_scale = v_scale.view(-1, kv_heads, v_scale.shape[-1])
+                assert k_scale.shape[:2] == k_cache.shape[:2]
+                assert v_scale.shape[:2] == v_cache.shape[:2]
+            layout = getattr(quant, "layout", "q8")
+        else:
+            physical_head_dim = k_raw.shape[-1]
+            k_cache = k_raw.view(-1, kv_heads, physical_head_dim)
+            v_cache = v_raw.view(-1, kv_heads, physical_head_dim)
+            k_scale = None
+            v_scale = None
+            layout = "q8"
 
         spec = attn_spec or AttentionSpec()
         indices = metadata.indices
@@ -188,6 +223,7 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                layout=layout,
             )
         if (
             (not metadata.is_decode)
@@ -206,10 +242,11 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sm_scale=scale,
                 sliding_window=spec.sliding_window,
                 sinks=spec.sinks,
-                k_extend=k.view(q.shape[0], kv_heads, head_dim),
-                v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                k_extend=k.view(q.shape[0], kv_heads, logical_head_dim),
+                v_extend=v.view(q.shape[0], kv_heads, logical_head_dim),
                 k_scale=k_scale,
                 v_scale=v_scale,
+                layout=layout,
             )
         return paged_attention(
             q=q,
@@ -224,6 +261,7 @@ class TritonAttentionBackend(BaseAttnBackend):
             sinks=spec.sinks,
             k_scale=k_scale,
             v_scale=v_scale,
+            layout=layout,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
