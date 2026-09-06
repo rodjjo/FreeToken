@@ -115,12 +115,27 @@ def _backend_requirements_met(name: str) -> bool:
 
 
 # --kv-cache-dtype spellings -> the stored EngineConfig.kv_quant value.
-KV_QUANT_ALIASES = {"auto": "none", "bf16": "none", "none": "none", "fp8": "fp8"}
+KV_QUANT_ALIASES = {
+    "auto": "none",
+    "bf16": "none",
+    "none": "none",
+    "fp8": "fp8",
+    "fp8_e4m3": "fp8_e4m3",
+    "q8_0": "q8_0",
+    "q4_0": "q4_0",
+    "q6_0": "q6_0",
+}
 
 
-def _resolve_kv_quant(value: str | None) -> str:
+def _resolve_kv_quant(value: str | Any | None) -> str:
     """Normalize a --kv-cache-dtype spelling to EngineConfig.kv_quant."""
-    key = (value or "auto").strip().lower()
+    if value is None:
+        return "none"
+    if hasattr(value, "enabled") and not value.enabled:
+        return "none"
+    if hasattr(value, "name"):
+        value = value.name
+    key = str(value).strip().lower()
     if key not in KV_QUANT_ALIASES:
         raise ValueError(
             f"unknown --kv-cache-dtype {value!r}; expected one of "
@@ -129,10 +144,14 @@ def _resolve_kv_quant(value: str | None) -> str:
     return KV_QUANT_ALIASES[key]
 
 
-def _backend_supports_kv_quant(name: str, kv_quant: str) -> bool:
+def _backend_supports_kv_quant(name: str, kv_quant: str | Any) -> bool:
     """Whether every comma part of an attention-backend string can read a quantized
     KV pool (an unquantized pool needs nothing from the backend)."""
-    if kv_quant == "none":
+    if hasattr(kv_quant, "enabled") and not kv_quant.enabled:
+        return True
+    if hasattr(kv_quant, "name"):
+        kv_quant = kv_quant.name
+    if kv_quant in ("none", "auto", "bf16"):
         return True
     return all(
         attention_backend_info(part.strip()).supports_fp8_kv for part in name.split(",")
@@ -1424,8 +1443,13 @@ def _adjust_config(config: EngineConfig):
     required_attn_types = _required_attn_types(model_config)
     # Resolve KV quantization BEFORE the backend tree: a quantized pool narrows both
     # which pool families are usable and which backend auto may pick.
-    kv_quant = _resolve_kv_quant(getattr(config, "kv_quant", "none"))
-    override("kv_quant", kv_quant)
+    from freetoken.kvcache.quant import resolve_kv_quant
+
+    raw_kv_quant = getattr(config, "kv_cache_dtype", getattr(config, "kv_quant", "auto"))
+    kv_quant_spec = resolve_kv_quant(raw_kv_quant)
+    override("kv_cache_dtype", kv_quant_spec.name)
+    override("kv_quant", kv_quant_spec)
+    kv_quant = "none" if not kv_quant_spec.enabled else kv_quant_spec.name
     if kv_quant != "none":
         # fp8 codes are wired through the pools that hand their rows to a Triton
         # kernel: the plain paged and hybrid-SWA ones, plus the QSA sparse pool, whose
@@ -1441,7 +1465,7 @@ def _adjust_config(config: EngineConfig):
                 f"--kv-cache-dtype {kv_quant} is implemented for the plain paged, "
                 "hybrid-SWA and QSA sparse KV pools; this model also needs "
                 f"{', '.join(sorted(t.value for t in quant_unsupported))} attention "
-                "(use --kv-cache-dtype bf16)."
+                "(use --kv-cache-dtype auto)."
             )
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
     if (

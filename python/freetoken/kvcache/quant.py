@@ -83,6 +83,24 @@ class KVQuantSpec:
             return True
         return self.storage_dtype == torch.int8
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            if not self.enabled:
+                return other.lower() in ("none", "auto", "bf16")
+            return self.name == other.lower() or (self.name == "fp8" and other.lower() == "fp8_e4m3") or (self.name == "fp8_e4m3" and other.lower() == "fp8")
+        if isinstance(other, KVQuantSpec):
+            return self.name == other.name
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+    def __str__(self) -> str:
+        return "none" if not self.enabled else self.name
+
+    def __bool__(self) -> bool:
+        return self.enabled
+
     def bytes_per_element(self, compute_dtype: torch.dtype) -> float:
         """Storage bytes per K/V element, scales amortized over the block.
 
@@ -308,6 +326,13 @@ Q8_0 = KVQuantSpec(name="q8_0", storage_dtype=torch.int8, max_magnitude=127.0)
 FP8_E4M3 = KVQuantSpec(
     name="fp8_e4m3", storage_dtype=torch.float8_e4m3fn, max_magnitude=448.0
 )
+# Per-token per-head FP8 (e4m3 codes + per-head fp32 scale) from PR 354
+FP8 = KVQuantSpec(
+    name="fp8",
+    storage_dtype=STORAGE_BYTE_DTYPE,
+    max_magnitude=448.0,
+    layout="fp8",
+)
 
 # Sub-byte schemes. Q4_0: 4-bit signed, 16 bytes/32 values = 0.5 byte/element.
 # The range is [-8, 7] (16 levels). max_magnitude = 8 -- the symmetric limit
@@ -340,16 +365,28 @@ Q6_0 = KVQuantSpec(
 
 NONE = KVQuantSpec(name="auto", storage_dtype=None, max_magnitude=0.0)
 
-_BY_NAME = {spec.name: spec for spec in (NONE, Q8_0, FP8_E4M3, Q4_0, Q6_0)}
-KV_CACHE_DTYPES = tuple(_BY_NAME)
+_BY_NAME = {
+    "auto": NONE,
+    "none": NONE,
+    "bf16": NONE,
+    "q8_0": Q8_0,
+    "fp8_e4m3": FP8_E4M3,
+    "fp8": FP8,
+    "q4_0": Q4_0,
+    "q6_0": Q6_0,
+}
+KV_CACHE_DTYPES = ("auto", "bf16", "q4_0", "q6_0", "q8_0", "fp8_e4m3", "fp8")
 
 
-def resolve_kv_quant(name: str | None) -> KVQuantSpec:
+def resolve_kv_quant(name: str | KVQuantSpec | None) -> KVQuantSpec:
     """``--kv-cache-dtype`` value -> spec. ``None``/``"auto"`` means unquantized."""
     if name is None:
         return NONE
+    if isinstance(name, KVQuantSpec):
+        return name
+    clean = str(name).strip().lower()
     try:
-        return _BY_NAME[name]
+        return _BY_NAME[clean]
     except KeyError:
         raise ValueError(
             f"unknown --kv-cache-dtype {name!r}; choose from {', '.join(KV_CACHE_DTYPES)}"
@@ -367,6 +404,7 @@ __all__ = [
     "KV_CACHE_DTYPES",
     "Q8_0",
     "FP8_E4M3",
+    "FP8",
     "Q4_0",
     "Q6_0",
     "NONE",

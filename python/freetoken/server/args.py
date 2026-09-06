@@ -373,10 +373,11 @@ def parse_args(
         help=(
             "KV-cache element storage. 'auto' keeps the compute dtype (bf16). 'q8_0' and "
             "'fp8_e4m3' store 8 bits plus an fp16 scale per 32 elements along head_dim "
-            "(1.0625 bytes/element vs 2), and the sub-byte 'q4_0'/'q6_0' pack multiple "
-            "values per byte (0.5625 / 0.8125 bytes/element), freeing VRAM for the MoE "
-            "expert cache. Needs the triton attention backend and head_dim divisible "
-            "by 32."
+            "(1.0625 bytes/element vs 2), 'fp8' stores e4m3 codes plus one fp32 scale "
+            "per (token, kv head), roughly doubling the tokens that fit in the same VRAM, "
+            "and the sub-byte 'q4_0'/'q6_0' pack multiple values per byte (0.5625 / 0.8125 "
+            "bytes/element), freeing VRAM for the MoE expert cache. Needs the triton "
+            "attention backend and a plain paged, hybrid-SWA or QSA sparse KV pool."
         ),
     )
 
@@ -385,21 +386,6 @@ def parse_args(
         type=int,
         default=ServerArgs.page_size,
         help="Set the page size for system management.",
-    )
-
-    parser.add_argument(
-        "--kv-cache-dtype",
-        dest="kv_quant",
-        type=str,
-        default=ServerArgs.kv_quant,
-        choices=["auto", "bf16", "fp8"],
-        help=(
-            "KV-cache storage format. 'bf16' (default) stores the compute dtype; 'fp8'"
-            " stores e4m3 codes plus one fp32 scale per (token, kv head), roughly "
-            "doubling the tokens that fit in the same VRAM. Requires the triton"
-            " attention backend and a plain paged, hybrid-SWA or QSA sparse KV pool"
-            " (not MLA/DSA, DSV4, or MiniMax-M3 block-sparse models)."
-        ),
     )
 
     parser.add_argument(

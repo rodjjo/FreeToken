@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 from freetoken.distributed import DistributedInfo
@@ -59,12 +59,7 @@ class EngineConfig:
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
-    # KV-cache storage quantization: "none" stores the compute dtype, "fp8" stores e4m3
-    # codes plus one fp32 scale per (token, slab, layer, kv head) -- about 2x the tokens
-    # per GiB, at a small accuracy cost. --kv-cache-dtype; resolved from "auto" by
-    # _adjust_config, which also refuses it on a pool family or attention backend that
-    # cannot read the scales.
-    kv_quant: str = "none"
+    kv_quant: Any = None
     memory_ratio: float = 0.9
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
@@ -89,16 +84,23 @@ class EngineConfig:
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
     # KV element storage (--kv-cache-dtype): "auto" keeps the compute dtype, "q8_0" and
-    # "fp8_e4m3" store 8 bits plus a per-block scale, and the sub-byte "q4_0"/"q6_0"
-    # pack multiple values per byte. Resolved through
+    # "fp8_e4m3" store 8 bits plus a per-block scale, "fp8" stores per-token/head fp8 e4m3 codes,
+    # and the sub-byte "q4_0"/"q6_0" pack multiple values per byte. Resolved through
     # freetoken.kvcache.quant.resolve_kv_quant by the pools and the cost model.
     kv_cache_dtype: str = "auto"
 
-    @cached_property
-    def kv_quant(self):
+    def __post_init__(self):
+        super_post = getattr(super(), "__post_init__", None)
+        if super_post is not None:
+            super_post()
+        if self.kv_quant is not None:
+            raw = self.kv_quant.name if hasattr(self.kv_quant, "name") else str(self.kv_quant)
+            if raw not in ("none", "auto", "bf16") and self.kv_cache_dtype in ("auto", "none", "bf16"):
+                object.__setattr__(self, "kv_cache_dtype", raw)
         from freetoken.kvcache.quant import resolve_kv_quant
 
-        return resolve_kv_quant(self.kv_cache_dtype)
+        object.__setattr__(self, "kv_quant", resolve_kv_quant(self.kv_cache_dtype))
+
 
     @cached_property
     def hf_config(self):
