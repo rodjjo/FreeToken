@@ -18,6 +18,9 @@ class PendingReq:
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
     mm_embeds: torch.Tensor | None = None
+    #: What the prefix cache keys this request on, when the raw ids are unsafe to key on (an
+    #: image prompt: every image expands to the same placeholder id). None -> key on input_ids.
+    cache_ids: torch.Tensor | None = None
 
     @property
     def input_len(self) -> int:

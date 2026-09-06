@@ -32,10 +32,13 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
+        # contiguous() so the buffer matches the shape we record (a view's strides do not
+        # survive the round trip). Shape is carried explicitly: image tensors from the HF
+        # processor are 3-D, and 1-D prompts still round-trip byte-for-byte.
+        serialized["buffer"] = self.detach().cpu().contiguous().numpy().tobytes()
         serialized["dtype"] = str(self.dtype)
+        serialized["shape"] = list(self.shape)
         return serialized
 
     # normal type
@@ -64,14 +67,17 @@ def _deserialize_any(cls_map: Dict[str, Type], data: Any) -> Any:
 
 def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
-    # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
         np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
         np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        tensor = torch.from_numpy(np_tensor.copy())
+        # ``shape`` is absent in messages from an older peer -> 1-D, the only shape that
+        # used to be serializable.
+        shape = data.get("shape")
+        return tensor.view(*shape) if shape else tensor
 
     cls = cls_map.get(type_name)
     if cls is None:

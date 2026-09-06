@@ -43,17 +43,14 @@ class LLM(Scheduler):
         self.counter = 0
 
     @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
-    ) -> torch.Tensor:
-        """Run the vision tower + projector on processor outputs, returning the
-        ``[num_image_tokens, hidden]`` soft-token embeddings (on device)."""
+    def encode_images(self, mm: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run the vision tower + projector on one request's processor bundle, returning
+        the ``[num_image_tokens, hidden]`` soft-token embeddings (on device). The bundle is
+        passed through as-is; only the model knows which keys it needs."""
         model = self.engine.model
         if not hasattr(model, "encode_images"):
             raise RuntimeError(f"{type(model).__name__} does not support image inputs")
-        return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
-        )
+        return model.encode_images({k: v.to(self.device) for k, v in mm.items()})
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
         if isinstance(prompt, str):

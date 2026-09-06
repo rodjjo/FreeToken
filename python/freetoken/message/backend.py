@@ -35,8 +35,22 @@ class UserMsg(BaseBackendMsg):
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # the in-process offline path, which owns the model and can run the vision tower
+    # itself; the serialized online path sends the processor tensors below instead and
+    # lets the scheduler encode them.
     mm_embeds: torch.Tensor | None = None
+    # Online image path: whatever this checkpoint's HF processor produced for the request's
+    # images, as CPU tensors, kept as one opaque bundle. The transport does not open it --
+    # only the model that will consume it knows which keys it needs (Qwen3-VL wants
+    # ``image_grid_thw``, gemma4 wants ``image_position_ids``, both want ``pixel_values``),
+    # so a new modality is a key here rather than a field on every layer in between.
+    mm_inputs: dict[str, torch.Tensor] | None = None
+    # Prefix-cache key ids for an image prompt: input_ids with each image's placeholder run
+    # replaced by ids derived from that image's content hash (tokenize._image_cache_ids). The
+    # model never sees this; it exists so a prompt carrying an image can share a prefix at all,
+    # which keying on the placeholders themselves would make unsafe. None keeps the old
+    # behaviour of not sharing.
+    cache_ids: torch.Tensor | None = None
 
 
 @dataclass

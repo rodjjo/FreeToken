@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from typing import Any, List
 
 import torch
@@ -32,6 +33,24 @@ from freetoken.utils import (
     load_tokenizer,
 )
 
+
+
+def _backend_msg(msg, input_ids, mm):
+    """One tokenized request as the scheduler's ``UserMsg``.
+
+    ``cache_ids`` travels inside the processor bundle -- that is the one channel the tokenizer
+    worker already has -- but it is not a model input, so it is lifted back out here: the
+    scheduler needs it at admission (prefix matching happens before the vision tower runs) and
+    ``encode_images`` should only ever be handed keys its processor produced."""
+    bundle = mm.as_dict() if mm is not None else None
+    cache_ids = bundle.pop("cache_ids", None) if bundle else None
+    return UserMsg(
+        uid=msg.uid,
+        input_ids=input_ids,
+        sampling_params=msg.sampling_params,
+        mm_inputs=bundle,
+        cache_ids=cache_ids,
+    )
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
     if isinstance(msg, BatchTokenizerMsg):
@@ -95,15 +114,19 @@ def _tokenize_requests(
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokens, mm = tokenize_manager.encode([msg])[0]
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
+            # Some exceptions carry no message at all -- transformers raises a bare
+            # StopIteration when a prompt has more image placeholders than images, and
+            # str() of that is "", which reached the client as "could not encode request: ".
+            detail = str(exc) or repr(exc)
             errors.append(
                 UserReply(
                     uid=msg.uid,
                     incremental_output="",
                     finished=True,
-                    error=f"could not encode request: {exc}",
+                    error=f"could not encode request: {detail}",
                 )
             )
             continue
@@ -120,8 +143,33 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
+        ok_tensors.append((tokens, mm))
     return ok_msgs, ok_tensors, errors
+
+
+def _image_processor_path(tokenizer_path: str) -> str | None:
+    """The local checkpoint dir to load an image processor from, or None.
+
+    The gate is the model FreeToken will actually build: ``is_multimodal`` is true only
+    when the model family has a vision tower here AND vision is switched on
+    (--vision). Checking the checkpoint's processor files alone is not
+    enough -- a multimodal checkpoint whose family is served text-only (Ornith /
+    qwen3_5_moe, ``vision_config=None``) ships processor configs but has no encode_images,
+    so accepting the image here would only fail later, further from the cause."""
+    try:
+        from freetoken.models.weight import _spec_for_model_path
+        from freetoken.utils import download_hf_weight
+
+        model_config, _ = _spec_for_model_path(tokenizer_path)
+        if not model_config.is_multimodal:
+            return None
+        folder = download_hf_weight(tokenizer_path)
+    except Exception:  # noqa: BLE001 - never block startup on this probe
+        return None
+    for name in ("processor_config.json", "preprocessor_config.json"):
+        if os.path.isfile(os.path.join(folder, name)):
+            return folder
+    return None
 
 
 @torch.inference_mode()
@@ -147,7 +195,14 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    # Image input needs the checkpoint's HF processor. Gate it on the same switch the
+    # model build uses (--vision): with vision off the scheduler has no
+    # vision tower to run, so accepting images here would only fail later and further from
+    # the cause. None => image blocks are rejected with a clear message.
+    processor_path = _image_processor_path(tokenizer_path)
+    tokenize_manager = TokenizeManager(tokenizer, processor_path=processor_path)
+    if processor_path is not None:
+        logger.info("image input enabled (processor: %s)", processor_path)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -254,8 +309,8 @@ def tokenize_worker(
                     )
                 if ok_msgs:
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        _backend_msg(msg, t, mm)
+                        for msg, (t, mm) in zip(ok_msgs, ok_tensors, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

@@ -68,22 +68,52 @@ class Gemma4Model(BaseOP):
     def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """Scatter precomputed image soft-token embeddings at image-token positions.
 
-        ``mm_embeds`` (set by the scheduler from each request's vision features) is a
-        ``[num_image_tokens, hidden]`` tensor whose rows replace the placeholder
-        embeddings produced for ``image_token_id``. Only runs during prefill batches
-        that carry images; decode batches never do.
+        Per REQUEST, over that request's own slice of the batch. A batch-wide mask counts
+        every image token in the forward against one request's features -- and the image
+        placeholder has a printable spelling, so any other request in the batch can add to
+        that count just by containing the string. The mismatch surfaces inside the forward,
+        which has no per-request recovery, so one request's text would take the worker down.
+
+        ``req.mm_embeds`` is set by the scheduler from that request's vision features and
+        covers the whole prompt; this forward takes the window of it belonging to the
+        placeholders inside its own chunk. Decode batches never carry images and take the
+        early return.
         """
         batch = get_global_ctx().batch
-        mm_embeds = getattr(batch, "mm_embeds", None)
-        if mm_embeds is None or self._image_token_id is None:
+        if not getattr(batch, "has_images", False) or self._image_token_id is None:
             return x
-        mask = input_ids == self._image_token_id
-        n_slots = int(mask.sum().item())
-        assert n_slots == mm_embeds.shape[0], (
-            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
-            "image tokens must not be split across prefill chunks"
-        )
-        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+        offset = 0
+        for req in batch.reqs:
+            n = req.extend_len
+            if req.mm_embeds is not None:
+                span = slice(offset, offset + n)
+                mask = input_ids[span] == self._image_token_id
+                n_slots = int(mask.sum())
+                if n_slots:
+                    # Rows for placeholders an earlier chunk (or a prefix-cache hit) already
+                    # consumed sit in front of this window; see qwen3_5_moe._merge_multimodal.
+                    # getattr + the zero test: nothing is cached on a first chunk, which is
+                    # every unchunked prompt, so the scan is skipped there -- and the scheduler
+                    # tests drive this with request stubs that carry neither field.
+                    cached = getattr(req, "cached_len", 0)
+                    ids = getattr(req, "input_ids", None)
+                    before = (
+                        int((ids[:cached] == self._image_token_id).sum())
+                        if cached and ids is not None
+                        else 0
+                    )
+                    embeds = req.mm_embeds[before : before + n_slots]
+                    # A raise, not an assert: `python -O` strips asserts, and what follows a
+                    # stripped one is masked_scatter quietly taking the wrong number of rows.
+                    if n_slots != embeds.shape[0]:
+                        raise RuntimeError(
+                            f"request {req.uid}: image-token slots ({n_slots}) != vision features "
+                            f"({embeds.shape[0]}) for this chunk (rows {before}..{before + n_slots} "
+                            f"of {req.mm_embeds.shape[0]})"
+                        )
+                    x[span] = x[span].masked_scatter(mask.unsqueeze(-1), embeds.to(x.dtype))
+            offset += n
+        return x
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
@@ -116,9 +146,16 @@ class Gemma4ForCausalLM(BaseLLMModel):
             convert_gemma4_to_gguf(self, config)
 
     @torch.inference_mode()
-    def encode_images(
-        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
-    ) -> torch.Tensor:
+    def encode_images(self, mm: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Takes the processor bundle and reads the keys this family needs -- the caller
+        does not know which those are, which is the point."""
+        pixel_values = mm["pixel_values"]
+        image_position_ids = mm.get("image_position_ids")
+        if image_position_ids is None:
+            raise RuntimeError(
+                "gemma4.encode_images needs 'image_position_ids' in mm_inputs; the "
+                f"processor produced {sorted(mm)}"
+            )
         """Run the vision tower + projector. Returns ``[num_valid_soft_tokens, text_hidden]``.
 
         ``pixel_values``: ``[num_images, num_patches, 3*patch**2]``;

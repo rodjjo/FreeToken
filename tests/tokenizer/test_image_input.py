@@ -1,0 +1,581 @@
+"""Image input on the online (server) path.
+
+The pieces that used to silently swallow pictures are the ones pinned here: the API
+layer's content flattening, the tokenizer worker's split, and the message serializer --
+each of which turned an image into nothing without ever raising.
+"""
+
+from __future__ import annotations
+
+import base64
+
+import pytest
+import torch
+
+from freetoken.message.utils import deserialize_type, serialize_type
+from freetoken.server.generation import _render_content_parts
+from freetoken.tokenizer.tokenize import split_image_parts
+
+PNG = base64.b64encode(b"not-a-real-png").decode()
+DATA_URL = f"data:image/png;base64,{PNG}"
+
+
+def _image_part(url: str = DATA_URL) -> dict:
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+# --------------------------------------------------------------------------- API layer
+def test_text_only_content_still_collapses_to_a_string():
+    """The long-standing behaviour every chat template depends on."""
+    out = _render_content_parts([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+    assert out == "ab"
+
+
+def test_content_with_an_image_survives_as_a_list():
+    parts = [_image_part(), {"type": "text", "text": "what is this?"}]
+    assert _render_content_parts(parts) == parts
+
+
+def test_unknown_content_part_is_still_rejected():
+    with pytest.raises(ValueError, match="Unsupported content part type"):
+        _render_content_parts([_image_part(), {"type": "audio_url"}])
+
+
+# ---------------------------------------------------------------- tokenizer-side split
+def test_split_replaces_images_with_template_placeholders():
+    msgs = [{"role": "user", "content": [_image_part(), {"type": "text", "text": "q"}]}]
+    rendered, images = split_image_parts(msgs)
+    # The template sees a bare {"type": "image"} -- that is what expands into image tokens.
+    assert rendered == [
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "q"}]}
+    ]
+    assert images == [b"not-a-real-png"]
+
+
+def test_split_preserves_image_order_across_messages():
+    a = base64.b64encode(b"first").decode()
+    b = base64.b64encode(b"second").decode()
+    msgs = [
+        {"role": "user", "content": [_image_part(f"data:image/png;base64,{a}")]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [_image_part(f"data:image/png;base64,{b}")]},
+    ]
+    _, images = split_image_parts(msgs)
+    assert images == [b"first", b"second"]  # processor consumes them in template order
+
+
+def test_split_leaves_text_only_messages_untouched():
+    msgs = [{"role": "user", "content": "plain"},
+            {"role": "user", "content": [{"type": "text", "text": "t"}]}]
+    rendered, images = split_image_parts(msgs)
+    assert rendered == msgs and images == []
+
+
+@pytest.mark.parametrize("url", ["https://example.com/x.png", "data:image/png,notbase64"])
+def test_non_inline_images_are_rejected(url):
+    """A remote URL would make the tokenizer worker fetch a caller-supplied address."""
+    with pytest.raises(ValueError):
+        split_image_parts([{"role": "user", "content": [_image_part(url)]}])
+
+
+# ------------------------------------------------------------------------ serialization
+def test_multidimensional_tensors_round_trip():
+    """Processor output is 3-D; the queue used to assert 1-D and kill the worker."""
+    for t in (torch.randn(1, 2520, 768), torch.zeros(2, 4, 2, dtype=torch.int64)):
+        got = deserialize_type({}, serialize_type(t))
+        assert got.shape == t.shape and got.dtype == t.dtype and torch.equal(got, t)
+
+
+def test_one_d_tensors_round_trip_unchanged():
+    t = torch.arange(5, dtype=torch.int32)
+    got = deserialize_type({}, serialize_type(t))
+    assert torch.equal(got, t) and got.dtype == t.dtype
+
+
+def test_non_contiguous_tensor_round_trips_by_value():
+    t = torch.randn(3, 4).t()  # a view: strides do not survive, values must
+    got = deserialize_type({}, serialize_type(t))
+    assert got.shape == t.shape and torch.equal(got, t.contiguous())
+
+
+def test_user_msg_carries_image_tensors():
+    from freetoken.core import SamplingParams
+    from freetoken.message import UserMsg
+
+    msg = UserMsg(
+        uid=1,
+        input_ids=torch.arange(3, dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        mm_inputs={
+            "pixel_values": torch.randn(1, 8, 12),
+            "image_position_ids": torch.zeros(1, 8, 2, dtype=torch.int64),
+        },
+    )
+    got = deserialize_type({"UserMsg": UserMsg, "SamplingParams": SamplingParams},
+                           serialize_type(msg))
+    assert got.mm_inputs["pixel_values"].shape == (1, 8, 12)
+    assert got.mm_inputs["image_position_ids"].shape == (1, 8, 2)
+    assert torch.equal(got.input_ids, msg.input_ids)
+
+
+# --------------------------------------------------- chunking around the image tokens
+# The rule is NOT "a multimodal prompt must fit one chunk" -- that made a 200-token sprite
+# force its 166k-token agent turn into a single prefill and get a 400 back. What one forward
+# must see whole is the IMAGE-TOKEN SPAN, because the model scatters the whole of mm_embeds
+# into the image tokens that chunk contains, and asserts the counts match.
+
+
+class _NoSwa:  # non-sliding-window cache: chunking is capped by token_budget alone
+    def __init__(self):
+        self.swa_paged = False
+        self.prefill_chunk_align = 1  # no snapshot-boundary alignment to respect
+        # _kv_reservation_size charges the adder in whole pages; 1 makes that the token count.
+        self.page_size = 1
+
+
+class _Tables:  # the token_pool row _add_one_req stages the chunk's ids into
+    def __init__(self, length: int):
+        import torch
+
+        self.token_pool = torch.zeros(1, length, dtype=torch.int32)
+
+
+def _pending(prompt_len: int, *, img_at: slice | None, n_img: int = 0, tok_id: int | None = None):
+    """A PendingReq whose prompt has `n_img` image tokens laid at `img_at`."""
+    import torch
+
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    ids = torch.zeros(prompt_len, dtype=torch.int32)
+    if img_at is not None:
+        ids[img_at] = tok_id
+    return PendingReq(
+        uid=9,
+        input_ids=ids,
+        sampling_params=SamplingParams(),
+        mm_embeds=torch.randn(n_img, 16) if n_img else None,
+    )
+
+
+def _adder(budget: int, prompt_len: int):
+    from freetoken.scheduler.prefill import PrefillAdder
+
+    return PrefillAdder(
+        token_budget=budget, reserved_size=0, cache_manager=_NoSwa(),
+        table_manager=_Tables(prompt_len),
+    )
+
+
+def test_a_long_prompt_with_a_small_image_chunks_instead_of_being_rejected():
+    """The regression this whole section exists for. 9383 tokens, 8192 of budget, and a
+    196-token image sitting near the front: the span fits chunk one, so the prompt chunks
+    like any other and the first chunk is the one that scatters."""
+    pending = _pending(9383, img_at=slice(100, 296), n_img=196, tok_id=151655)
+    got = _adder(8192, 9383)._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is not None, "must be admitted, not rejected"
+    assert got.extend_len == 8192, "chunked at the token budget like a text prompt"
+    assert got.mm_embeds is not None
+
+
+def test_an_unchunked_multimodal_prompt_is_untouched():
+    """The common case -- prompt fits one chunk -- is one forward with every row."""
+    pending = _pending(500, img_at=slice(10, 206), n_img=196, tok_id=151655)
+    got = _adder(8192, 500)._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is not None and got.extend_len == 500
+
+
+# ------------------------------------------------------------------------ the span itself
+# ------------------------------------------------------------------ vision-capable gate
+def test_text_only_family_never_gets_an_image_processor(monkeypatch):
+    """A multimodal CHECKPOINT served by a text-only family (Ornith / qwen3_5_moe, whose
+    parse_config pins vision_config=None) ships processor files but has no encode_images.
+    Accepting the image at the tokenizer would only fail later, further from the cause."""
+    from types import SimpleNamespace
+
+    import freetoken.models.weight as weight_mod
+    from freetoken.tokenizer.server import _image_processor_path
+
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setattr(
+        weight_mod, "_spec_for_model_path",
+        lambda path: (SimpleNamespace(is_multimodal=False), None),
+    )
+    assert _image_processor_path("some/text-only-model") is None
+
+
+def test_probe_failure_disables_images_rather_than_blocking_startup(monkeypatch):
+    import freetoken.models.weight as weight_mod
+    from freetoken.tokenizer.server import _image_processor_path
+
+    def _boom(path):
+        raise RuntimeError("unresolvable path")
+
+    monkeypatch.setenv("FREETOKEN_LOAD_VISION", "1")
+    monkeypatch.setattr(weight_mod, "_spec_for_model_path", _boom)
+    assert _image_processor_path("nonexistent/model") is None
+
+
+# ------------------------------------------------- budget: transient vs terminal
+def test_a_stray_placeholder_in_another_request_cannot_break_this_one(monkeypatch):
+    """`<|image_pad|>` has a printable spelling and tokenizes straight to the image id, so a
+    plain text request can carry it. Under a batch-wide mask its tokens counted against the
+    image request's embeddings -- a mismatch inside the forward, which has no per-request
+    recovery, so one request's text took the whole worker down."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    img_req = SimpleNamespace(
+        uid=1, extend_len=6, mm_embeds=torch.full((2, 4), 9.0), mm_scatter=True)
+    text_req = SimpleNamespace(uid=2, extend_len=3, mm_embeds=None, mm_scatter=True)
+    # request 1: [t, IMG, IMG, t, t, t]   request 2 (attacker): [t, IMG, t]
+    input_ids = torch.tensor([5, IMG, IMG, 5, 5, 5, 7, IMG, 7])
+    x = torch.zeros(9, 4)
+    batch = SimpleNamespace(reqs=[img_req, text_req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+
+    out = mod.Qwen3_5Model._merge_multimodal(SimpleNamespace(_image_token_id=IMG), input_ids, x)
+    assert out[1].tolist() == [9.0] * 4 and out[2].tolist() == [9.0] * 4
+    assert out[7].tolist() == [0.0] * 4, "the other request's placeholder is left alone"
+
+
+def test_a_count_mismatch_raises_rather_than_asserts(monkeypatch):
+    """`python -O` strips asserts, and what follows a stripped one is masked_scatter quietly
+    taking the wrong number of rows."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    # Two placeholders in this forward, one row to scatter: the window comes up short. The
+    # opposite case (more rows than the WHOLE prompt has placeholders) is refused at admission,
+    # in Scheduler._encode_images, where it is still a per-request error reply.
+    req = SimpleNamespace(uid=1, extend_len=3, mm_embeds=torch.zeros(1, 4))
+    batch = SimpleNamespace(reqs=[req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    with pytest.raises(RuntimeError, match="image-token slots"):
+        mod.Qwen3_5Model._merge_multimodal(
+            SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, IMG, 5]), torch.zeros(3, 4)
+        )
+
+
+def test_the_image_path_quantizes_reasoning_effort_like_every_other_path():
+    """render_prompt sanitizes reasoning_effort; encode_multimodal must too, or an
+    unsupported value renders differently depending on whether the request had an image."""
+    from types import SimpleNamespace
+
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    seen = {}
+
+    class _Proc:
+        def apply_chat_template(self, messages, **kw):
+            seen.update(kw)
+            return "PROMPT"
+
+        def __call__(self, text, images, return_tensors):
+            import torch
+
+            return {"input_ids": torch.zeros(1, 3, dtype=torch.long),
+                    "pixel_values": torch.zeros(1, 2, 2)}
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = _Proc()
+    mgr._processor_lock = __import__("threading").Lock()
+    mgr._processor_path = "unused"
+    mgr._logged_effort_maps = set()
+    from freetoken.tokenizer.effort import EffortProfile
+
+    mgr.effort_profile = lambda: EffortProfile(
+        supported=frozenset({"low", "high"}), default="low",
+        consumes_effort=True, validates=True,
+    )
+
+    import io as _io
+
+    from PIL import Image as _Image
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    msg = SimpleNamespace(chat_template_kwargs={"reasoning_effort": "ludicrous"}, tools=None)
+    mgr.encode_multimodal(msg, [{"role": "user", "content": "x"}], [buf.getvalue()])
+    assert seen.get("reasoning_effort") != "ludicrous", seen
+
+
+def test_the_tokenize_worker_still_carries_inference_mode():
+    """The decorator sat on tokenize_worker until a helper was inserted between them, which
+    silently moved every worker tokenization out of inference_mode."""
+    import freetoken.tokenizer.server as srv
+
+    assert hasattr(srv.tokenize_worker, "__wrapped__"), (
+        "tokenize_worker lost @torch.inference_mode()"
+    )
+    assert not hasattr(srv._image_processor_path, "__wrapped__"), (
+        "the decorator landed on the helper instead"
+    )
+
+
+def test_no_image_support_is_a_client_error_not_a_server_fault():
+    """count_tokens has no per-request isolation to fall back on, so 'this deployment has no
+    vision tower' has to be distinguishable from 'the processor failed to load'."""
+    from freetoken.tokenizer.tokenize import ImageInputUnsupported, TokenizeManager
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = None
+    mgr._processor_lock = __import__("threading").Lock()
+    mgr._processor_path = None
+    with pytest.raises(ImageInputUnsupported):
+        mgr._processor()
+    assert issubclass(ImageInputUnsupported, ValueError), "callers still catch ValueError"
+
+
+def test_a_literal_placeholder_in_the_text_names_itself_in_the_error():
+    """transformers raises StopIteration when the text has more placeholders than images, and
+    str(StopIteration()) is empty -- the client got 'could not encode request: ' and nothing
+    else. Catch it before the processor and say what is wrong."""
+    import io as _io
+    import threading as _threading
+    from types import SimpleNamespace
+
+    from PIL import Image as _Image
+
+    from freetoken.tokenizer.tokenize import TokenizeManager
+
+    class _Proc:
+        image_token = "<|image_pad|>"
+
+        def apply_chat_template(self, messages, **kw):
+            return "user: <|image_pad|> and a literal <|image_pad|> <|image_pad|>"
+
+        def __call__(self, *a, **k):  # pragma: no cover - must not be reached
+            raise AssertionError("the pre-check should have fired first")
+
+    mgr = TokenizeManager.__new__(TokenizeManager)
+    mgr._processor_obj = _Proc()
+    mgr._processor_lock = _threading.Lock()
+    mgr._processor_path = "unused"
+    mgr._logged_effort_maps = set()
+    mgr.effort_profile = lambda: None
+
+    buf = _io.BytesIO()
+    _Image.new("RGB", (4, 4)).save(buf, format="PNG")
+    msg = SimpleNamespace(chat_template_kwargs=None, tools=None)
+    with pytest.raises(ValueError, match=r"2 literal .*image_pad"):
+        mgr.encode_multimodal(msg, [{"role": "user", "content": "x"}], [buf.getvalue()])
+
+
+def test_a_messageless_exception_still_says_something():
+    """`f"{exc or exc!r}"` applies !r to the WHOLE expression, so it reads repr() even for a
+    normal exception. The client should see the message when there is one, the type when
+    there is not."""
+    assert (lambda e: str(e) or repr(e))(ValueError("boom")) == "boom"
+    assert (lambda e: str(e) or repr(e))(StopIteration()) == "StopIteration()"
+
+
+# --------------------------------------------------- the same hole in gemma4
+def test_gemma4_also_scatters_per_request(monkeypatch):
+    """gemma4 carried the identical batch-wide mask and assert. It is a separate model file,
+    so the qwen3_5_moe fix does not reach it -- and the failure mode is the same worker kill."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.gemma4.model as g4
+
+    IMG = 262144
+    img_req = SimpleNamespace(
+        uid=1, extend_len=4, mm_embeds=torch.full((2, 3), 7.0), mm_scatter=True)
+    text_req = SimpleNamespace(uid=2, extend_len=2, mm_embeds=None, mm_scatter=True)
+    input_ids = torch.tensor([1, IMG, IMG, 1, 2, IMG])
+    batch = SimpleNamespace(reqs=[img_req, text_req], has_images=True)
+    monkeypatch.setattr(g4, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+
+    out = g4.Gemma4Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), input_ids, torch.zeros(6, 3)
+    )
+    assert out[1].tolist() == [7.0] * 3 and out[2].tolist() == [7.0] * 3
+    assert out[5].tolist() == [0.0] * 3, "the other request's placeholder is left alone"
+
+
+def test_a_text_only_batch_never_walks_the_requests(monkeypatch):
+    """has_images is the whole point of the flag: every decode step and every text prefill
+    must take the early return rather than iterate the batch."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    class _Boom(list):
+        def __iter__(self):  # pragma: no cover - must not be reached
+            raise AssertionError("a text-only batch must not walk its requests")
+
+    batch = SimpleNamespace(reqs=_Boom(), has_images=False)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    x = torch.zeros(3, 4)
+    assert mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=5), torch.tensor([1, 2, 3]), x
+    ) is x
+
+
+def test_a_span_wider_than_one_chunk_now_chunks_instead_of_being_rejected():
+    """The rule this replaced: every image token of the prompt in ONE chunk. A conversation
+    reaches that limit by TALKING between screenshots -- the span runs first image to last, so
+    it grows with the text in between -- and the request was then terminal. It now chunks."""
+    pending = _pending(20000, img_at=slice(100, 10100), n_img=10000, tok_id=151655)
+    adder = _adder(8192, 20000)
+    got = adder._add_one_req(
+        pending_req=pending, cache_handle=None, table_idx=0, cached_len=0
+    )
+    assert got is not None
+    assert adder.rejected == []
+    assert got.extend_len == 8192  # a plain chunk, boundary inside the span
+
+
+def test_each_chunk_scatters_only_its_own_rows(monkeypatch):
+    """The window: rows for placeholders an earlier chunk consumed sit in front of it."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    # Prompt is [IMG, IMG, 5, IMG]; this forward is the tail, so one placeholder is already done.
+    embeds = torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
+    req = SimpleNamespace(
+        uid=1, extend_len=3, mm_embeds=embeds, cached_len=1,
+        input_ids=torch.tensor([IMG, IMG, 5, IMG]),
+    )
+    batch = SimpleNamespace(reqs=[req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    x = torch.zeros(3, 2)
+    out = mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), torch.tensor([IMG, 5, IMG]), x
+    )
+    # rows 1 and 2 -- not 0, which the previous chunk scattered
+    assert out[0].tolist() == [2.0, 2.0]
+    assert out[1].tolist() == [0.0, 0.0]
+    assert out[2].tolist() == [3.0, 3.0]
+
+
+def test_a_chunk_with_no_image_tokens_scatters_nothing(monkeypatch):
+    """Every chunk of an image prompt is flagged now, so the one that happens to carry no
+    placeholder has to be a no-op rather than scattering the next chunk's rows."""
+    import torch
+    from types import SimpleNamespace
+
+    import freetoken.models.qwen3_5_moe.model as mod
+
+    IMG = 151655
+    req = SimpleNamespace(
+        uid=1, extend_len=3, mm_embeds=torch.ones(2, 2), cached_len=0,
+        input_ids=torch.tensor([5, 5, 5, IMG, IMG]),
+    )
+    batch = SimpleNamespace(reqs=[req], has_images=True)
+    monkeypatch.setattr(mod, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    out = mod.Qwen3_5Model._merge_multimodal(
+        SimpleNamespace(_image_token_id=IMG), torch.tensor([5, 5, 5]), torch.zeros(3, 2)
+    )
+    assert out.abs().sum().item() == 0.0
+
+
+# ------------------------------------------------------- prefix-cache keys for image prompts
+def _ck(input_ids, images, tok_id=151655):
+    import torch
+
+    from freetoken.tokenizer.tokenize import _image_cache_ids
+
+    return _image_cache_ids(torch.tensor(input_ids, dtype=torch.int32), tok_id, images)
+
+
+def test_the_same_image_keys_the_same_and_a_different_one_does_not():
+    """The whole point: a prompt carrying an image can share a prefix, and the run it shares on
+    is the image's CONTENT -- otherwise a hit hands one image's KV to another, since every
+    image expands to the same placeholder id."""
+    import torch
+
+    a = _ck([1, 151655, 151655, 2], [b"picture-A"])
+    again = _ck([1, 151655, 151655, 2], [b"picture-A"])
+    b = _ck([1, 151655, 151655, 2], [b"picture-B"])
+    assert torch.equal(a, again)
+    assert not torch.equal(a, b)
+    # only the run moves; the text around it still keys on itself
+    assert a[0] == 1 and a[3] == 2
+    assert b[0] == 1 and b[3] == 2
+
+
+def test_the_key_ids_sit_above_every_vocabulary():
+    """A derived id must never collide with a real token."""
+    from freetoken.tokenizer.tokenize import _IMAGE_KEY_BASE
+
+    ids = _ck([1, 151655, 151655, 2], [b"x"])
+    assert int(ids[1]) >= _IMAGE_KEY_BASE and int(ids[2]) >= _IMAGE_KEY_BASE
+    assert int(ids[1]) != int(ids[2])  # position within the run is carried
+
+
+def test_each_image_keys_on_its_own_run():
+    """Two runs, two images: swapping the SECOND must not change the key of the first."""
+    import torch
+
+    ab = _ck([151655, 9, 151655, 151655], [b"A", b"B"])
+    ac = _ck([151655, 9, 151655, 151655], [b"A", b"C"])
+    assert int(ab[0]) == int(ac[0])          # first image's run is untouched
+    assert ab[2:].tolist() != ac[2:].tolist()  # second image's run changed
+
+
+def test_runs_that_do_not_match_the_image_count_fall_back_to_one_hash():
+    """A template that merges two images into one adjoining run cannot be split per image.
+    Keying the whole placeholder set on one combined hash is coarser -- a prompt differing only
+    in its LAST image no longer shares the prefix in front of the first -- but never wrong."""
+    import torch
+
+    two = _ck([1, 151655, 151655, 2], [b"A", b"B"])   # 1 run, 2 images -> combined
+    other = _ck([1, 151655, 151655, 2], [b"A", b"C"])
+    assert not torch.equal(two, other)
+
+
+def test_no_placeholder_or_no_image_produces_no_key():
+    assert _ck([1, 2, 3], [b"A"]) is None
+    assert _ck([1, 151655, 2], []) is None
+
+
+def test_the_cache_key_is_padded_to_the_ids_it_is_compared_against():
+    """cache_ids is built over the PROMPT; input_ids grows by every sampled token. The cache
+    manager slices both by the same cached_len, so a short key would insert fewer ids than
+    there are pages and leak the rest."""
+    import torch
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.cache import _key_ids
+
+    req = SimpleNamespace(
+        input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32),
+        cache_ids=torch.tensor([1, 9, 9], dtype=torch.int32),
+    )
+    assert _key_ids(req).tolist() == [1, 9, 9, 4, 5]
+
+
+def test_a_text_request_keys_on_its_own_ids():
+    import torch
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.cache import _key_ids
+
+    ids = torch.tensor([1, 2, 3], dtype=torch.int32)
+    assert _key_ids(SimpleNamespace(input_ids=ids, cache_ids=None)) is ids
+    assert _key_ids(SimpleNamespace(input_ids=ids)) is ids  # scheduler-test stubs carry no field
+
+
+def test_the_image_pixel_ceiling_is_overridable():
+    """The checkpoint's own processor only downscales above 16.7 Mpx, which never fires; the
+    default here is what keeps a 4K screenshot from costing more than one prefill chunk."""
+    from freetoken.tokenizer import tokenize as tk
+
+    assert tk.IMAGE_MAX_PIXELS == 1280 * 28 * 28
+    assert tk.IMAGE_MIN_PIXELS == 4 * 28 * 28

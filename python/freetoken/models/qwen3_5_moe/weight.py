@@ -131,10 +131,20 @@ def _load_maybe_quantized(f, raw_name: str, keyset: set[str]) -> torch.Tensor:
     return tensor
 
 
-def _rename(raw_name: str) -> str | None:
+#: The tower's own prefix in the checkpoint. Stripped to ``visual.*``, which is what
+#: :class:`~freetoken.models.qwen3_5_moe.vision.Qwen3_5VisionModel` expects under
+#: ``Qwen3_5MoEForCausalLM.visual``.
+_VISUAL_PREFIXES = ("model.visual.", "visual.")
+
+
+def _rename(raw_name: str, *, include_vision: bool = False) -> str | None:
     """HF key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    for pfx in _VISUAL_PREFIXES:
+        if raw_name.startswith(pfx):
+            # bf16 throughout, no scales: the tower loads verbatim, no quant path involved.
+            return "visual." + raw_name[len(pfx):] if include_vision else None
     # ModelOpt FP8 KV-cache static scales (full-attention layers only). FreeToken keeps the
     # KV cache in the engine's native precision (>= the checkpoint's quantized KV), so these
     # per-tensor q/k/v scales are unused -- drop them rather than fail as unexpected keys.
@@ -179,6 +189,9 @@ def iter_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     hf_config = cached_load_hf_config(model_path)
     config = parse_config(hf_config)
+    # One switch for the whole load: parse_config returns vision_config=None unless
+    # --vision was given, so is_multimodal follows the flag.
+    include_vision = config.is_multimodal
     if _compressed_tensors_nvfp4(hf_config):
         # Dense compressed-tensors NVFP4 (e.g. Qwen3.6-27B): attn (q/k/v/o, GDN out_proj) +
         # dense MLP are W4A16 NVFP4; GDN in_proj_*, lm_head, norms bf16.
@@ -186,6 +199,7 @@ def iter_weights(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             nvfp4=config.dense_quant == "nvfp4",
+            include_vision=include_vision,
         )
         return
     if config.expert_quant == "fp8_block":
@@ -195,6 +209,7 @@ def iter_weights(
         yield from _iter_weights_fp8(
             model_path, device,
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
+            include_vision=include_vision,
         )
         return
     if config.attn_quant == "fp8_pertensor":
@@ -207,6 +222,7 @@ def iter_weights(
             include_non_moe=include_non_moe, include_moe_experts=include_moe_experts,
             dense_nvfp4=config.dense_quant == "nvfp4",
             lmhead_nvfp4=config.lm_head_quant == "nvfp4",
+            include_vision=include_vision,
         )
         return
     tp_info = get_tp_info()
@@ -239,7 +255,7 @@ def iter_weights(
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
 
@@ -427,6 +443,7 @@ def _dense_nvfp4_emit(
 def _iter_weights_attn_fp8(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
     dense_nvfp4: bool = False, lmhead_nvfp4: bool = False,
+    include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for the modelopt MIXED_PRECISION Qwen3.5 checkpoint.
 
@@ -463,7 +480,7 @@ def _iter_weights_attn_fp8(
                 if raw_name.endswith(_SCALE_SUFFIXES):
                     continue  # scales consumed with their .weight
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
                 if _PACKED_EXPERT_PATTERN.match(name) is not None:
@@ -565,6 +582,7 @@ def _ct_nvfp4_fuse(base: str, parts_tuple: tuple, buf: dict):
 def _iter_weights_compressed_tensors(
     model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool,
     nvfp4: bool,
+    include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Dense pass for a compressed-tensors NVFP4 checkpoint (e.g. Qwen3.6-27B).
 
@@ -605,12 +623,17 @@ def _iter_weights_compressed_tensors(
             disable=not tp_info.is_primary(),
         ):
             for raw_name in reader.names_in(file):
-                if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+                if raw_name.startswith("mtp."):
+                    continue
+                if raw_name.startswith(_VISUAL_PREFIXES):
+                    if not include_vision:
+                        continue
+                    yield "visual." + raw_name.split("visual.", 1)[1], reader.get(file, raw_name)
                     continue
                 if raw_name.endswith(_CT_SCALE_SUFFIXES):
                     continue  # consumed with weight_packed (or unused W4A4 activation scales)
 
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
 
@@ -751,7 +774,8 @@ def _fp8_fuse(base: str, suf: str, tensor: torch.Tensor, buf: dict) -> tuple[str
 
 
 def _iter_weights_fp8(
-    model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool = False
+    model_path: str, device: torch.device, *, include_non_moe: bool, include_moe_experts: bool = False,
+    include_vision: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield the block-fp8 weights, renamed + fused to the model buffers.
 
@@ -771,7 +795,7 @@ def _iter_weights_fp8(
                          disable=not get_tp_info().is_primary()):
             with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
                 for raw_name in f.keys():
-                    name = _rename(raw_name)
+                    name = _rename(raw_name, include_vision=include_vision)
                     if name is None or ".mlp.experts." in name:
                         continue  # routed experts handled below / by the offload cache
                     tensor = f.get_tensor(raw_name)

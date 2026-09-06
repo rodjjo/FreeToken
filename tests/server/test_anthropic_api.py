@@ -811,7 +811,7 @@ def test_frontend_tokenizer_concurrent_first_build_dedupes():
 
     orig_load, orig_tm = _utils.load_tokenizer, _tok.TokenizeManager
     _utils.load_tokenizer = _slow_load
-    _tok.TokenizeManager = lambda tok: tok
+    _tok.TokenizeManager = lambda tok, processor_path=None: tok
     try:
         fm = FrontendManager(
             config=SimpleNamespace(model_path="dedupe-test"),

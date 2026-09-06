@@ -50,22 +50,24 @@ def _tokenize_msg(uid: int) -> TokenizeMsg:
 
 def test_successful_tokenization_does_not_account_prompt_before_admission():
     class Tokenizer:
-        def tokenize(self, messages):
-            return [torch.tensor([10, 11, 12], dtype=torch.int32)]
+        # encode() returns (input_ids, multimodal-or-None) per message.
+        def encode(self, messages):
+            return [(torch.tensor([10, 11, 12], dtype=torch.int32), None)]
 
     ok, tensors, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
     assert [msg.uid for msg in ok] == [1]
-    assert tensors[0].tolist() == [10, 11, 12]
+    assert tensors[0][0].tolist() == [10, 11, 12]
+    assert tensors[0][1] is None  # text-only request carries no image tensors
     assert errors == []  # in particular, no early prompt_tokens_delta UserReply
 
 
 def test_tokenization_failure_and_empty_prompt_are_terminal_without_usage():
     class Tokenizer:
-        def tokenize(self, messages):
+        def encode(self, messages):
             uid = messages[0].uid
             if uid == 2:
                 raise ValueError("bad template")
-            return [torch.empty(0, dtype=torch.int32)]
+            return [(torch.empty(0, dtype=torch.int32), None)]
 
     logger = _Logger()
     ok, tensors, errors = _tokenize_requests(
@@ -91,7 +93,7 @@ def test_schedule_reports_admission_only_after_prepare_succeeds():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 4), (2, 34, 0)])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
-    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
+    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch, drain_rejections=lambda: [])
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
     events = []
 
@@ -115,7 +117,7 @@ def test_prepare_failure_emits_no_prompt_admission():
     batch = SimpleNamespace(is_prefill=True, prompt_admissions=[(1, 12, 0)])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.prefill_budget = 99
-    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch)
+    scheduler.prefill_manager = SimpleNamespace(schedule_next_batch=lambda budget: batch, drain_rejections=lambda: [])
     scheduler.decode_manager = SimpleNamespace(schedule_next_batch=lambda: None)
     sent = []
 

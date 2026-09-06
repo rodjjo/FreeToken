@@ -47,6 +47,24 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # (uid, reason, prior_chunk) for requests this pass found unschedulable no matter how long
+    # they wait. The manager drains these into terminal replies and drops them from the queue.
+    # prior_chunk is the already-forwarded ChunkedReq when a CONTINUATION is rejected: the
+    # request leaves the queue, so its KV pages / table slot / GDN slots have no other owner
+    # left to free them. None for a fresh admission, which this adder releases itself.
+    rejected: List[Tuple[int, str, Req | None]] = field(default_factory=list)
+    def _release_admission(self, handle, table_idx, linear_slot_idx, ping_pong) -> None:
+        """Undo _try_allocate_one. Nothing has been forwarded, so this is the cheap release:
+        drop the prefix-cache lock, hand back the table row, return the GDN slots. Without it
+        every declined admission -- terminal OR transient (an swa chunk that could not be
+        page-aligned) -- leaked a table slot and three state slots per attempt."""
+        self.cache_manager.unlock(handle)
+        self.table_manager.free(table_idx)
+        if self.cache_manager.is_hybrid:
+            pool = self.cache_manager.linear_state_pool
+            slots = [s for s in (linear_slot_idx, *(ping_pong or ())) if s is not None]
+            if slots:
+                pool.free(slots)
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -121,6 +139,7 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        chunked_req: Req | None = None,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -164,6 +183,13 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
+        # An image prompt chunks like text. The model windows mm_embeds to the placeholders
+        # inside each forward (qwen3_5_moe._merge_multimodal), so a boundary may fall between
+        # two images, or between an image and the text around it, without the scatter losing
+        # track of which rows are still owed. What used to be enforced here -- every image
+        # token of the prompt in ONE chunk -- rejected an agent turn as soon as the distance
+        # from its first screenshot to its last outgrew --max-prefill-length, which a long
+        # conversation reaches by talking, not by sending bigger pictures.
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -171,11 +197,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -185,6 +206,13 @@ class PrefillAdder:
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
             mm_embeds=pending_req.mm_embeds,
+            # Sliced exactly like input_ids above: the cache manager indexes both by
+            # cached_len, so a chunk's key must cover the same span its ids do.
+            cache_ids=(
+                None
+                if pending_req.cache_ids is None
+                else pending_req.cache_ids[: cached_len + chunk_size]
+            ),
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -200,6 +228,9 @@ class PrefillAdder:
             return None
 
         if chunked_req := pending_req.chunked_req:
+            # A rejection here carries chunked_req so the scheduler frees the pages, table row
+            # and GDN slots the ALREADY-FORWARDED chunks own; a transient None leaves the
+            # request (and its resources) in the queue for the next pass, which is correct.
             return self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=chunked_req.cache_handle,
@@ -210,6 +241,7 @@ class PrefillAdder:
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
+                chunked_req=chunked_req,
             )
 
         if resource := self._try_allocate_one(pending_req):
@@ -225,12 +257,11 @@ class PrefillAdder:
                 restore_src=restore_src,
             )
             if req is None:
-                # no aligned chunk this pass: undo the admission (a continuation keeps its
-                # resources -- they belong to the prior chunk's Req)
-                self.cache_manager.unlock(cache_handle)
-                self.table_manager.free(table_idx)
-                if linear_slot_idx is not None:
-                    self.cache_manager.linear_state_pool.free([linear_slot_idx, *ping_pong])
+                # Declined -- no aligned chunk this pass, or terminal. Either way nothing was
+                # forwarded, so undo the admission. (A continuation never comes through here:
+                # its resources belong to the prior chunk's Req, freed by the scheduler on a
+                # rejection and kept across a transient decline.)
+                self._release_admission(cache_handle, table_idx, linear_slot_idx, ping_pong)
             return req
 
         return None
@@ -242,10 +273,23 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    # Terminal (uid, reason, prior_chunk) triples produced by the last scheduling pass; the
+    # scheduler drains them into error replies and frees prior_chunk when it is not None.
+    rejections: List[Tuple[int, str, Req | None]] = field(default_factory=list)
+
+    def drain_rejections(self) -> List[Tuple[int, str, Req | None]]:
+        out, self.rejections = self.rejections, []
+        return out
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                cache_ids=req.cache_ids,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
@@ -287,6 +331,13 @@ class PrefillManager:
                     log_cached_tokens += req.cache_handle.cached_len
             else:
                 break  # We cannot add more requests
+        if adder.rejected:
+            # Drop them before the prefix arithmetic below: a rejected request must not be
+            # retried. Only genuinely unschedulable prompts land here -- a request that merely
+            # lost this pass's budget race declines transiently and stays in the queue.
+            rejected_uids = {uid for uid, _, _ in adder.rejected}
+            self.rejections.extend(adder.rejected)
+            self.pending_list = [p for p in self.pending_list if p.uid not in rejected_uids]
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]

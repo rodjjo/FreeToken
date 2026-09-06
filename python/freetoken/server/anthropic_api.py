@@ -66,6 +66,24 @@ STOP_REASON_MAP = {
 }
 
 
+def _anthropic_image_part(source: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Anthropic ``image`` source -> OpenAI ``image_url`` part, or None if unusable.
+
+    Only ``type: "base64"`` is accepted: a ``url`` source would have the server fetch a
+    caller-supplied address, which is not something a local inference server should do on
+    a request's behalf.
+    """
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") != "base64":
+        return None
+    data = source.get("data")
+    media = source.get("media_type") or "image/png"
+    if not data:
+        return None
+    return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
+
+
 def _anthropic_stop(finish_reason: str | None, matched_stop: str | None) -> tuple[str | None, str | None]:
     """(stop_reason, stop_sequence). A stop-string hit is reported as 'stop_sequence'
     with the matched string, otherwise the finish_reason is mapped normally."""
@@ -214,7 +232,13 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
+                # Forward as an OpenAI-style data URL -- the shape the tokenizer worker
+                # splits out (split_image_parts). A checkpoint without vision rejects it
+                # there with a clear message; before this the block was dropped silently,
+                # which looked like the model ignoring the picture.
+                part = _anthropic_image_part(block.source)
+                if part is not None:
+                    content_parts.append(part)
                 continue
             elif block.type == "tool_use":
                 tool_calls.append(
