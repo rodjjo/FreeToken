@@ -250,8 +250,6 @@ def _store_kv_quant_kernel(
             # every arch (it lowers as a truncating fp32 -> fp16 -> e4m3 double-round
             # on sm_89), so values just above a grid midpoint collapse downward and
             # disagree with the RNE torch reference. Round explicitly first.
-            from freetoken.kernel.triton.e4m3_compat import round_e4m3
-
             q = round_e4m3(tl.minimum(tl.maximum(q, -MAX_MAG), MAX_MAG))
 
         # ---- pack into the storage dtype ----
