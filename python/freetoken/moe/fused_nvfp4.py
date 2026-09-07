@@ -45,6 +45,9 @@ def _run_act(
     ``swiglu_clamp`` (GLM-5.3, same clamp without the +1 up bias) carry the
     per-model ``act_alpha``/``act_limit`` scalars; the plain *_and_mul kinds
     ignore them."""
+    if activation == "relu2":
+        torch.square(torch.relu(gate_up), out=out)
+        return
     if activation == "swigluoai":
         swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
         return
@@ -187,7 +190,7 @@ def _fused_experts_decode_nvfp4(
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
-    inter = two_i // 2
+    inter = two_i if activation == "relu2" else two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
 
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
@@ -331,7 +334,7 @@ def fused_experts_nvfp4(
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
-    inter = two_i // 2
+    inter = two_i if activation == "relu2" else two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg = _prefill_config(M)
 

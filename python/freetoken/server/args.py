@@ -122,6 +122,15 @@ def parse_args(
 
         return gpu_arg(value)
 
+    def _positive_ratio(value: str) -> float:
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number in (0, 1]") from exc
+        if not 0 < ratio <= 1:
+            raise argparse.ArgumentTypeError("must be in (0, 1]")
+        return ratio
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -151,7 +160,14 @@ def parse_args(
             return "muse_glimmer"
         if "gemma4" in marker:
             return "gemma4"
-        if "qwen4_exp" in marker or "qwen4exp" in marker or "qwen3.8-flash" in marker:
+        # Nemotron-3 Super ships the Qwen3-Coder XML tool grammar
+        # (<tool_call><function=...><parameter=...>) in its chat template.
+        if (
+            "qwen4_exp" in marker
+            or "qwen4exp" in marker
+            or "qwen3.8-flash" in marker
+            or any(tag in marker for tag in ("nemotron-3", "nemotron_3", "nemotronh"))
+        ):
             return "qwen3_coder"
         if (
             "qwen3_5" in marker
@@ -190,6 +206,9 @@ def parse_args(
         marker = " ".join(candidates).lower()
         if "gpt_oss" in marker or "gpt-oss" in marker or "gptoss" in marker:
             return "gpt_oss"
+        # Nemotron-3 Super's generation prompt opens an implicit <think> block.
+        if any(tag in marker for tag in ("nemotron-3", "nemotron_3", "nemotronh")):
+            return "qwen3"
         if "deepseek" in marker and any(
             tag in marker for tag in ("v4", "deepseek_v4", "v3.2", "v32")
         ):
@@ -389,6 +408,21 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        type=str,
+        choices=list(KV_CACHE_DTYPES),
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "KV-cache element storage. 'auto' keeps the compute dtype (bf16); 'q8_0' and "
+            "'fp8_e4m3' use 1.0625 bytes/element, while 'q4_0' (also accepted as 'int4') "
+            "uses 0.5625 bytes/element with llama.cpp-compatible GGML Q4_0 quantization. "
+            "Each includes an fp16 scale per 32 head-dim elements. q8_0 is the most accurate "
+            "compact format; q4_0 maximizes capacity. Needs the triton "
+            "attention backend and head_dim divisible by 32."
+        ),
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
@@ -412,6 +446,18 @@ def parse_args(
         choices=SUPPORTED_CACHE_MANAGER.supported_names(),
         help="KV cache strategy (naive | radix). For hybrid GDN models 'radix' is materialized "
         "as a GDN-aware radix (cross-request GDN-state prefix reuse); pass 'naive' to opt out.",
+    )
+
+    parser.add_argument(
+        "--swa-full-tokens-ratio",
+        type=_positive_ratio,
+        default=ServerArgs.swa_full_tokens_ratio,
+        help=(
+            "Sliding-window KV-pool size as a fraction of the full-attention KV token "
+            "capacity. The runtime concurrency/window floor still applies. Lower values "
+            "leave more VRAM for long-context full-attention KV; effective only for "
+            "sliding-window models with radix caching."
+        ),
     )
 
     parser.add_argument(
@@ -602,6 +648,18 @@ def parse_args(
             "CUDA pinning is quota-capped, e.g. WSL (locks just enough head+tail "
             "layers when the banks exceed the pin budget, none otherwise); '0' "
             "forces all layers on GPU."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-pageable-gpu",
+        action="store_true",
+        default=ServerArgs.moe_pageable_gpu,
+        help=(
+            "On hosts with a CUDA pinning quota (notably WSL), keep expert-bank "
+            "overflow layers pageable and stage only routed cache misses through a "
+            "small pinned buffer. All expert math remains on GPU, at the cost of "
+            "eager decode and an extra RAM copy for overflow layers."
         ),
     )
 

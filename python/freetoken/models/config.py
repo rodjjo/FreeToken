@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Literal, Tuple, TypeAlias
 
 from freetoken.attention.base import AttnType
@@ -261,6 +261,7 @@ class SlotStateSpec:
 class ModelConfig:
     num_layers: int
     num_qo_heads: int
+    num_qo_heads_per_layer: tuple[int, ...] | None = field(default=None, kw_only=True)  # hybrid models (laguna) vary per layer; None means uniform num_qo_heads.
     num_kv_heads: int
     head_dim: int
     hidden_size: int
@@ -335,6 +336,14 @@ class ModelConfig:
     has_attn_bias: bool = False
     has_router_bias: bool = False
     moe_weight_format: str | None = None
+    # GGUF checkpoints only: ggml quant type of ``token_embd.weight`` (publisher-dependent
+    # -- Q6_K in Google's QAT release, Q4_0 in Unsloth's). None for non-GGUF checkpoints.
+    gguf_embed_quant: int | None = None
+    # Mixed-type GGUF (laguna): (gate_up_type, down_type) ggml ids per MoE layer,
+    # read from the file's tensor table. None for uniform-quant checkpoints.
+    gguf_expert_types: tuple[tuple[int, int], ...] | None = None
+    # source .gguf path; laguna reads per-tensor quant types from it at conversion
+    gguf_model_path: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
@@ -364,6 +373,15 @@ class ModelConfig:
     # Extra per-request tensors riding the LinearStatePool slots (see SlotStateSpec);
     # () for models without any. Requires a linear-attention group to ride on.
     slot_states: Tuple[SlotStateSpec, ...] = ()
+    # Explicit sparse-MoE layer set for hybrid mixer-only architectures.  None keeps the
+    # conventional contiguous [first_k_dense_replace, num_layers) layout.
+    moe_layer_ids: tuple[int, ...] | None = None
+    # Routed-expert input/output width when it differs from the residual-stream hidden size
+    # (Nemotron-H projects 4096 -> 1024 around its experts).
+    expert_hidden_size: int | None = None
+    expert_gated: bool = True
+    # Opaque Nemotron-H mixer geometry / per-module quantization metadata.
+    nemotron_h_args: Any | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -376,6 +394,8 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
+        if self.moe_layer_ids is not None:
+            return len(self.moe_layer_ids)
         return self.num_layers - self.first_k_dense_replace
 
     @property
@@ -444,6 +464,12 @@ class ModelConfig:
             self.attention_group_for_layer(layer_id),
             LinearGatedDeltaGroupConfig,
         )
+
+    def qo_heads(self, layer_id: int) -> int:
+        """Query-head count for one layer (per-layer override or the uniform count)."""
+        if self.num_qo_heads_per_layer is not None:
+            return self.num_qo_heads_per_layer[layer_id]
+        return self.num_qo_heads
 
     def attn_type_for_layer(self, layer_id: int) -> AttnType:
         """Canonical per-layer attention-type lookup (the taxonomy is declared

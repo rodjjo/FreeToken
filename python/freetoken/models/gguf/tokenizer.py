@@ -12,8 +12,55 @@ from typing import Any
 
 from .reader import gguf_architecture, load_gguf_metadata
 
+
+# llama.cpp / GGUF token type values (gguf.TokenType).  CONTROL tokens are true
+# special tokens, while USER_DEFINED tokens must participate in the added-token
+# matcher without being removed by ``skip_special_tokens``.  The latter distinction
+# matters for Qwen3.5: markers such as ``<think>`` and ``<tool_call>`` are type 4 and
+# the byte-level BPE otherwise splits them into ordinary punctuation/word tokens even
+# though their complete strings are present in the base vocabulary.
+_GGUF_TOKEN_CONTROL = 3
+_GGUF_TOKEN_USER_DEFINED = 4
+
+
+def _register_gguf_added_tokens(tokenizer, tokens: list[str], token_types: list[int] | None) -> None:
+    """Restore GGUF CONTROL/USER_DEFINED matching semantics on a fast tokenizer.
+
+    Transformers' Qwen GGUF converter currently hard-codes only ``<|endoftext|>``,
+    ``<|im_start|>`` and ``<|im_end|>``.  Newer Qwen-family checkpoints carry more
+    USER_DEFINED tokens in the GGUF table; merely putting those strings in a BPE
+    vocabulary does not make the tokenizer match them atomically.
+    """
+    if not token_types or len(token_types) != len(tokens):
+        return
+
+    from tokenizers import AddedToken
+
+    control = [
+        AddedToken(token, normalized=False, special=True)
+        for token, token_type in zip(tokens, token_types)
+        if int(token_type) == _GGUF_TOKEN_CONTROL
+    ]
+    user_defined = [
+        AddedToken(token, normalized=False, special=False)
+        for token, token_type in zip(tokens, token_types)
+        if int(token_type) == _GGUF_TOKEN_USER_DEFINED
+    ]
+    if control:
+        tokenizer.add_special_tokens({"additional_special_tokens": control})
+    if user_defined:
+        tokenizer.add_tokens(user_defined)
+
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+# laguna ships a plain gpt2-style BPE (tokenizer.ggml.model = "gpt2"); transformers
+# has no "laguna" converter, so route it to the gpt2 one.
+_TOKENIZER_ARCH = {
+    "gemma4": "gemma4_text",
+    "laguna": "gpt2",
+    # Qwen3.5-MoE retains Qwen3's tokenizer; only the model architecture label
+    # changed in llama.cpp. Transformers has no qwen35moe converter key.
+    "qwen35moe": "qwen3_moe",
+}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -28,9 +75,14 @@ def load_gguf_tokenizer(model_path: str):
         for k, v in meta.items()
         if k.startswith("tokenizer.ggml.")
     }
-    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
-
     tokens = tok_dict["tokens"]
+    # Some converters (gpt2) read .bos_token/.eos_token off the skeleton, which the
+    # GGUF metadata only carries as ids -- materialize the token strings.
+    for name in ("bos", "eos"):
+        tid = tok_dict.get(f"{name}_token_id")
+        if f"{name}_token" not in tok_dict and tid is not None and int(tid) < len(tokens):
+            tok_dict[f"{name}_token"] = tokens[int(tid)]
+    fast, _extra = convert_gguf_tokenizer(conv_arch, tok_dict)
 
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
@@ -43,9 +95,13 @@ def load_gguf_tokenizer(model_path: str):
         tokenizer_object=fast,
         bos_token=tok_for("bos_token_id", "<bos>"),
         eos_token=turn_end or tok_for("eos_token_id", "<eos>"),
-        unk_token=tok_for("unknown_token_id", "<unk>"),
+        # Qwen has no unknown token. Adding a synthetic <unk> would create id
+        # ``vocab_size`` (one beyond the embedding table) for genuinely unknown
+        # input, turning a tokenizer fallback into an out-of-bounds lookup.
+        unk_token=None if arch == "qwen35moe" else tok_for("unknown_token_id", "<unk>"),
         pad_token=tok_for("padding_token_id", "<pad>"),
     )
+    _register_gguf_added_tokens(tokenizer, tokens, tok_dict.get("token_type"))
     chat_template = meta.get("tokenizer.chat_template")
     if chat_template:
         tokenizer.chat_template = chat_template
@@ -53,7 +109,10 @@ def load_gguf_tokenizer(model_path: str):
 
 
 def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
-    """Stop ids for GGUF generation: the formal <eos> plus the chat turn end <turn|>."""
+    """Stop ids for GGUF generation: the formal <eos>, the chat turn end <turn|>, the
+    GGUF-declared eot, and gemma4's tool-response opener <|tool_response> (the model
+    emits it right after closing a tool call, so it is a stop id upstream too --
+    generation_config.json ships eos_token_id [1, 106, 50])."""
     meta = load_gguf_metadata(model_path)
     tokens = meta["tokenizer.ggml.tokens"]
     ids: set[int] = set()
@@ -64,7 +123,10 @@ def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
         ids.add(int(eid))
     # Look the stop tokens up in the vocab directly (convert_tokens_to_ids would map an
     # absent name to <unk>, wrongly adding it as a stop id).
-    for name in ("<eos>", "<turn|>"):
+    eot = meta.get("tokenizer.ggml.eot_token_id")
+    if eot is not None:
+        ids.add(int(eot))
+    for name in ("<eos>", "<turn|>", "<|tool_response>"):
         try:
             ids.add(tokens.index(name))
         except ValueError:

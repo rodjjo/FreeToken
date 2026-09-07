@@ -175,6 +175,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         # tower is ~0.8 GiB of bf16 that a text-only deployment never reads.
         self.visual = Qwen3_5VisionModel(config.vision_config) if config.is_multimodal else None
         super().__init__()
+        from .gguf import convert_qwen3_5_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen3_5_to_gguf(self, config)
 
     def encode_images(self, mm: dict[str, torch.Tensor]) -> torch.Tensor:
         """Takes the processor bundle and reads the keys this family needs -- the caller

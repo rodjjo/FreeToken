@@ -66,6 +66,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.qwen4_exp",
         "Qwen4ExpForCausalLM",
     ),
+    "Qwen3_5MoeGGUFForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen3_5_moe",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the
     # loader handles the compressed-tensors NVFP4 layout.
@@ -115,6 +121,16 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    "LagunaGGUFForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
+    "LagunaForCausalLM": ModelSpec(
+        "freetoken.models.laguna",
+        "LagunaForCausalLM",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
@@ -142,6 +158,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
     "Glm5NextForCausalLM": ModelSpec(
         "freetoken.models.glm5_next",
         "Glm5NextForCausalLM",
+    ),
+    "NemotronHForCausalLM": ModelSpec(
+        "freetoken.models.nemotron_h",
+        "NemotronHForCausalLM",
     ),
 }
 
