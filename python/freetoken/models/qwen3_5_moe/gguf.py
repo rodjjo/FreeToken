@@ -72,12 +72,85 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     full_ids = tuple(i for i in range(layers) if (i + 1) % interval == 0)
     linear_ids = tuple(i for i in range(layers) if i not in full_ids)
 
+    # RoPE scaling (YaRN) resolution:
+    # Priority:
+    # 1. Environment variables (FREETOKEN_ROPE_FACTOR, FREETOKEN_ROPE_TYPE)
+    # 2. Companion config.json next to GGUF file
+    # 3. GGUF metadata keys (rope.scaling.factor, etc.)
+    import json
+    import os
+
+    rope_scaling = None
+    max_position = context
+
+    # 1. Probe companion config.json if present
+    cfg_scaling = None
+    model_dir = os.path.dirname(getattr(shim, "model_path", "") or "")
+    if model_dir:
+        cfg_file = os.path.join(model_dir, "config.json")
+        if os.path.isfile(cfg_file):
+            try:
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                tc = cdata.get("text_config", cdata)
+                cfg_scaling = tc.get("rope_scaling") or tc.get("rope_parameters") or cdata.get("rope_scaling")
+            except Exception:
+                pass
+
+    # 2. Probe GGUF metadata
+    gguf_factor = shim.metadata.get("qwen35moe.rope.scaling.factor") or shim.metadata.get("rope.scaling.factor")
+    gguf_type = shim.metadata.get("qwen35moe.rope.scaling.type") or shim.metadata.get("rope.scaling.type") or "yarn"
+    gguf_orig = shim.metadata.get("qwen35moe.rope.scaling.original_context_length") or shim.metadata.get("rope.scaling.original_context_length")
+
+    # 3. Probe env vars (highest priority CLI/runner override)
+    env_factor = os.environ.get("FREETOKEN_ROPE_FACTOR")
+    env_type = os.environ.get("FREETOKEN_ROPE_TYPE")
+    env_orig = os.environ.get("FREETOKEN_ROPE_ORIG_CTX")
+
+    if env_factor is not None:
+        factor = float(env_factor)
+        rope_type = (env_type or "yarn").lower()
+        orig_ctx = int(env_orig) if env_orig else context
+        if factor > 1.0 and rope_type != "default":
+            rope_scaling = {
+                "rope_type": rope_type,
+                "factor": factor,
+                "original_max_position_embeddings": orig_ctx,
+            }
+            if os.environ.get("FREETOKEN_ROPE_ATTN_FACTOR"):
+                rope_scaling["attention_factor"] = float(os.environ["FREETOKEN_ROPE_ATTN_FACTOR"])
+            if os.environ.get("FREETOKEN_ROPE_BETA_FAST"):
+                rope_scaling["beta_fast"] = float(os.environ["FREETOKEN_ROPE_BETA_FAST"])
+            if os.environ.get("FREETOKEN_ROPE_BETA_SLOW"):
+                rope_scaling["beta_slow"] = float(os.environ["FREETOKEN_ROPE_BETA_SLOW"])
+            max_position = int(orig_ctx * factor)
+    elif cfg_scaling and isinstance(cfg_scaling, dict):
+        factor = float(cfg_scaling.get("factor", 1.0))
+        rope_type = str(cfg_scaling.get("rope_type") or cfg_scaling.get("type") or "default").lower()
+        orig_ctx = int(cfg_scaling.get("original_max_position_embeddings", context))
+        if factor > 1.0 and rope_type != "default":
+            rope_scaling = {k: v for k, v in cfg_scaling.items() if not isinstance(v, (list, dict))}
+            rope_scaling["rope_type"] = rope_type
+            rope_scaling["factor"] = factor
+            rope_scaling["original_max_position_embeddings"] = orig_ctx
+            max_position = int(orig_ctx * factor)
+    elif gguf_factor is not None and float(gguf_factor) > 1.0:
+        factor = float(gguf_factor)
+        rope_type = str(gguf_type).lower()
+        orig_ctx = int(gguf_orig) if gguf_orig else context
+        rope_scaling = {
+            "rope_type": rope_type,
+            "factor": factor,
+            "original_max_position_embeddings": orig_ctx,
+        }
+        max_position = int(orig_ctx * factor)
+
     rotary = RotaryConfig(
         head_dim=head_dim,
         rotary_dim=int(_g(shim, "rope.dimension_count")),
-        max_position=context,
+        max_position=max_position,
         base=float(_g(shim, "rope.freq_base")),
-        scaling=None,
+        scaling=rope_scaling,
     )
     state_dim = int(_g(shim, "ssm.state_size"))
     inner = int(_g(shim, "ssm.inner_size"))
