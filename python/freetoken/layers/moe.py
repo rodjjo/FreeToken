@@ -544,6 +544,7 @@ class OffloadMoELayer(MoELayer):
                 down_type=self.gguf_down_type,
                 gate_up_rows=self.gguf_gate_up_rows,
                 down_rows=self.gguf_down_rows,
+                is_prefill=is_prefill,
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

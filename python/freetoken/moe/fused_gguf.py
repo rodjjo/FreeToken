@@ -101,7 +101,7 @@ def _use_mma_moe(quant_type, stride, x, capability) -> bool:
     return _mma_mmq_ok()
 
 
-def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride, *, broadcast=True):
+def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride, *, broadcast=True, is_prefill=True):
     """Choose grouped MMQ for prefill and MMVQ for decode/small tails.
 
     ``broadcast=True``: ``x[tokens, in]`` shared by each token's top_k experts
@@ -117,7 +117,8 @@ def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride, *,
 
     capability = _device_capability(x.device.index) if x.is_cuda else None
     if (
-        _MMA_MOE_MIN_TOKENS <= tokens <= _MMA_MAX_TOKENS
+        is_prefill
+        and _MMA_MOE_MIN_TOKENS <= tokens <= _MMA_MAX_TOKENS
         and _use_mma_moe(quant_type, stride, x, capability)
     ):
         from freetoken.kernel.gguf import ggml_moe_a8_mma
@@ -132,7 +133,7 @@ def _moe_matmul(x, weight, topk_ids, top_k, quant_type, rows, tokens, stride, *,
         topk_ids = topk_ids.reshape(-1, 1)
         tokens = tokens * top_k
         top_k = 1
-    if tokens >= mmq_min_tokens(capability):
+    if is_prefill and tokens >= mmq_min_tokens(capability):
         from freetoken.kernel.gguf import ggml_moe_a8, ggml_moe_get_block_size
         from freetoken.moe.fused import moe_align_block_size
 
@@ -169,6 +170,7 @@ def fused_experts_gguf(
     down_type: int,
     gate_up_rows: int,  # 2 * intermediate
     down_rows: int,  # hidden
+    is_prefill: bool = True,
 ) -> torch.Tensor:
     act_fn = _ACT.get(activation)
     if act_fn is None:
@@ -215,6 +217,7 @@ def fused_experts_gguf(
     gate_up = _moe_matmul(
         hidden_states, gate_up_q, topk_ids, top_k, int(gate_up_type),
         gate_up_rows, num_tokens, gate_up_q.shape[1],
+        is_prefill=is_prefill,
     )
     inter = act_fn(gate_up)
     # Down pass: one selected-expert row per (token, k). _moe_matmul flattens to
@@ -223,6 +226,7 @@ def fused_experts_gguf(
     out = _moe_matmul(
         inter, down_q, topk_ids, top_k, int(down_type),
         down_rows, num_tokens, down_q.shape[1], broadcast=False,
+        is_prefill=is_prefill,
     )
     out = out.reshape(num_tokens, top_k, down_rows) * topk_weights.reshape(
         num_tokens, top_k, 1
