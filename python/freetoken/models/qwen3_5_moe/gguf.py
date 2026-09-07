@@ -132,6 +132,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         gguf_embed_quant=gguf_tensor_type(shim.model_path, "token_embd.weight"),
         gguf_expert_types=_expert_types(shim),
         gguf_model_path=shim.model_path,
+        mtp_num_layers=int(shim.metadata.get("qwen35moe.nextn_predict_layers", 1)),
     )
 
 
