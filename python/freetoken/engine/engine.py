@@ -210,7 +210,6 @@ def _resolve_auto_attention_backend(
 def _validate_kv_cache_dtype(config, model_config) -> None:
     """Gate --kv-cache-dtype against what the quantized path actually implements.
 
-<<<<<<< HEAD
     Quantized KV storage lives in the triton attention kernels and the MHA/hybrid-SWA
     pools. The quantized path is reachable only when every attention group routes to
     those pools (FULL/SWA via triton), so this rejects at config time: any non-triton
@@ -222,13 +221,6 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
     the message: reject here rather than leak a downstream "backend does not support
     dsv4" error that suggests --attention-backend triton, which the first gate would
     then reject in turn.
-=======
-    Compact KV storage (8-bit and packed int4) lives in the Triton attention kernels and
-    MHA/hybrid-SWA pools. Every other backend reads the KV slabs through its own kernels
-    (flashinfer's ``kv_data_type``, trtllm's fp8 path) which this has not been wired into,
-    and the MLA/DSA/DSV4/BSA pools have their own slab layouts. Reject those combinations
-    here at config time, rather than letting a wrong-dtype tensor reach a kernel.
->>>>>>> pr-196
     """
     quant = getattr(config, "kv_quant", None)
     if quant is None or not quant.enabled:
@@ -236,7 +228,6 @@ def _validate_kv_cache_dtype(config, model_config) -> None:
 
     from freetoken.kvcache.quant import BLOCK
 
-<<<<<<< HEAD
     # Family gates first: name the pool family the quant cannot reach before the
     # backend check, so these users never see "Pass --attention-backend triton" --
     # the backend-capability gate (_validate_attention_backend_choice) would reject
