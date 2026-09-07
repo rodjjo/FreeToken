@@ -177,6 +177,11 @@ def experts_scattered(model_path: str) -> bool:
     effort heuristic: ANY failure (unresolvable path, no safetensors, GGUF, unreadable
     header) -> False (serial), so the real loader still runs and reports real errors."""
     try:
+        from freetoken.models.gguf.reader import is_gguf_path
+
+        if is_gguf_path(model_path):
+            return False
+
         from freetoken.utils.hf import download_hf_weight
 
         model_path = download_hf_weight(model_path)  # resolve hub ids -> local (parity w/ serial)

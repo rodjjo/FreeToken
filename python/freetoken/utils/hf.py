@@ -225,7 +225,7 @@ def _weight_allow_patterns(repo_id: str) -> list[str]:
 
 
 def download_hf_weight(model_path: str) -> str:
-    if os.path.isdir(model_path):
+    if os.path.exists(model_path):
         return model_path
     try:
         return snapshot_download(

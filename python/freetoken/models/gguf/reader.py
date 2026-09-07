@@ -18,6 +18,7 @@ from typing import Any, Iterator
 
 import numpy as np
 import torch
+import warnings
 
 
 def is_gguf_path(model_path: str) -> bool:
@@ -109,7 +110,9 @@ class GgufTensor:
 
     def packed(self) -> torch.Tensor:
         """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
-        return torch.from_numpy(self._raw)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            return torch.from_numpy(self._raw)
 
 
 def _field_value(reader, name: str) -> Any:
